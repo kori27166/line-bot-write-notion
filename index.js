@@ -1,19 +1,36 @@
-// Render entrypoint: run as a normal Express server
 const express = require("express");
-const serverless = require("serverless-http");
+const line = require("@line/bot-sdk");
 
-// Import the existing serverless handler from api/server.js
-// api/server.js exports: exports.handler = serverless(app);
-const { handler } = require("./api/server");
+// LINE config (these must exist in Render Environment Variables)
+const config = {
+  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.CHANNEL_SECRET,
+};
 
-// Create an Express app and mount the serverless handler
 const app = express();
 
-// LINE webhook will be POST /webhook
-app.all("/webhook", (req, res) => handler(req, res));
-
-// Optional health check endpoint
+// Health check
 app.get("/", (req, res) => res.status(200).send("OK"));
+
+// Webhook endpoint (LINE will POST here)
+// IMPORTANT: middleware verifies signature and parses body
+app.post("/webhook", line.middleware(config), (req, res) => {
+  // Always respond quickly
+  res.status(200).send("OK");
+
+  // For now we just log events (next step: write to Notion)
+  try {
+    console.log("LINE events:", JSON.stringify(req.body.events || []));
+  } catch (e) {
+    console.error("Log error:", e);
+  }
+});
+
+// Error handler (avoid 502)
+app.use((err, req, res, next) => {
+  console.error("Express error:", err);
+  res.status(200).send("OK");
+});
 
 const port = process.env.PORT || 8888;
 app.listen(port, "0.0.0.0", () => {
