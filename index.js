@@ -576,13 +576,15 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 });
 
 // ========= Start =========
-(async () => {
+async function boot() {
   await loadInboxDbSchema();
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
     console.log(`CLOUDINARY_ENABLED=${CLOUDINARY_ENABLED}`);
   });
-})().catch((e) => {
+}
+
+boot().catch((e) => {
   console.error('Startup error:', e);
   process.exit(1);
-})();
+});
