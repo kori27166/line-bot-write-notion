@@ -77,7 +77,7 @@ function pickExistingInboxProps(props) {
 
 // ========= Simple per-user mode state (in-memory) =========
 // NOTE: Render restart will clear it. If you want persistence, we can store it in Notion/Redis later.
-const userMode = new Map(); // key: userId, value: 'FOLLOWUP'|'SEARCH'|null
+const userMode = new Map(); // key: userId, value: {mode:'FOLLOWUP'|'SEARCH', ts:number}
 
 function setMode(userId, mode) {
   if (!userId) return;
@@ -89,7 +89,7 @@ function getMode(userId) {
   const v = userMode.get(userId);
   if (!v) return null;
 
-  // optional: auto-expire in 5 minutes
+  // auto-expire in 5 minutes
   if (Date.now() - v.ts > 5 * 60 * 1000) {
     userMode.delete(userId);
     return null;
@@ -187,6 +187,7 @@ function getQuickReply() {
       { type: 'action', action: { type: 'message', label: '⏳ Waiting-Internal', text: '/list Waiting- internal' } },
       { type: 'action', action: { type: 'message', label: '📞 Waiting-Customer', text: '/list Waiting- customer' } },
       { type: 'action', action: { type: 'message', label: '🚧 In progress', text: '/list In progress' } },
+      { type: 'action', action: { type: 'message', label: '❌ Cancel', text: '/cancel' } },
       { type: 'action', action: { type: 'message', label: 'ℹ️ Help', text: '/help' } },
     ],
   };
@@ -387,6 +388,7 @@ function buildHelpText() {
     'Buttons:',
     '➕ Follow up → 進入輸入模式（下一則訊息會建立 follow up）',
     '🔍 Search Action → 進入輸入模式（下一則訊息會搜尋）',
+    '❌ Cancel → 取消輸入模式',
     '',
     'Non-command:',
     '- 直接打字/分享連結 → 進 INBOX（自動抓 URL→URL 欄位）',
@@ -454,6 +456,20 @@ async function handleTextMessage(event) {
 
   // ---- If user is in a mode, consume this message ----
   const mode = getMode(userId);
+
+  // ✅ Guard: if user shares a URL while in mode, treat as INBOX and cancel mode
+  const maybeUrl = extractFirstUrl(text);
+  if (mode && maybeUrl) {
+    setMode(userId, null);
+    try {
+      await createInboxTextItem(text);
+      return replyText(replyToken, `已收進 INBOX（自動退出模式）：${safePreview(text, 60)}`);
+    } catch (e) {
+      console.error('Notion write error (INBOX text in mode):', e);
+      return replyText(replyToken, '寫入 INBOX 失敗（請看 logs）。');
+    }
+  }
+
   if (mode === 'FOLLOWUP') {
     setMode(userId, null);
     try {
@@ -595,6 +611,13 @@ async function handleNonTextMessage(event) {
 
 async function handleEvent(event) {
   try {
+    // debug: see what LINE actually sends for share
+    console.log('[EVENT]', {
+      type: event.type,
+      msgType: event.message?.type,
+      textPreview: (event.message?.text || '').slice(0, 80),
+    });
+
     if (event.type !== 'message') return null;
 
     const msgType = event.message?.type;
