@@ -75,6 +75,28 @@ function pickExistingInboxProps(props) {
   return filtered;
 }
 
+// ========= Simple per-user mode state (in-memory) =========
+// NOTE: Render restart will clear it. If you want persistence, we can store it in Notion/Redis later.
+const userMode = new Map(); // key: userId, value: 'FOLLOWUP'|'SEARCH'|null
+
+function setMode(userId, mode) {
+  if (!userId) return;
+  if (!mode) userMode.delete(userId);
+  else userMode.set(userId, { mode, ts: Date.now() });
+}
+
+function getMode(userId) {
+  const v = userMode.get(userId);
+  if (!v) return null;
+
+  // optional: auto-expire in 5 minutes
+  if (Date.now() - v.ts > 5 * 60 * 1000) {
+    userMode.delete(userId);
+    return null;
+  }
+  return v.mode;
+}
+
 // ========= Helpers =========
 function safePreview(text, maxLen = 60) {
   const t = (text || '').trim().replace(/\s+/g, ' ');
@@ -144,16 +166,7 @@ function getTaskTitle(page) {
 function getPriorityRank(page) {
   const p = page?.properties?.[ACTION_PROP_PRIORITY];
   const name = p?.select?.name || '';
-  // customize mapping if your priority values differ
-  const map = {
-    High: 3,
-    Medium: 2,
-    Low: 1,
-    P0: 4,
-    P1: 3,
-    P2: 2,
-    P3: 1,
-  };
+  const map = { High: 3, Medium: 2, Low: 1, P0: 4, P1: 3, P2: 2, P3: 1 };
   return map[name] || 0;
 }
 
@@ -162,41 +175,19 @@ function normalizeStatusArg(raw) {
 }
 
 // ========= Quick Reply =========
+// Quick Reply message action WILL SEND immediately.
+// We use it as "mode switch" rather than "prefill input".
 function getQuickReply() {
   return {
     items: [
-      {
-        type: 'action',
-        action: { type: 'message', label: '➕ Follow up', text: '/f ' }, // note trailing space
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '🔍 Search Action', text: '? ' }, // note trailing space
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '📊 List Count', text: '/list' },
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '📂 Open', text: '/list open' },
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '⏳ Waiting-Internal', text: '/list Waiting- internal' },
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '📞 Waiting-Customer', text: '/list Waiting- customer' },
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: '🚧 In progress', text: '/list In progress' },
-      },
-      {
-        type: 'action',
-        action: { type: 'message', label: 'ℹ️ Help', text: '/help' },
-      },
+      { type: 'action', action: { type: 'message', label: '➕ Follow up', text: '/followup' } },
+      { type: 'action', action: { type: 'message', label: '🔍 Search Action', text: '/search' } },
+      { type: 'action', action: { type: 'message', label: '📊 List Count', text: '/list' } },
+      { type: 'action', action: { type: 'message', label: '📂 Open', text: '/list open' } },
+      { type: 'action', action: { type: 'message', label: '⏳ Waiting-Internal', text: '/list Waiting- internal' } },
+      { type: 'action', action: { type: 'message', label: '📞 Waiting-Customer', text: '/list Waiting- customer' } },
+      { type: 'action', action: { type: 'message', label: '🚧 In progress', text: '/list In progress' } },
+      { type: 'action', action: { type: 'message', label: 'ℹ️ Help', text: '/help' } },
     ],
   };
 }
@@ -225,15 +216,9 @@ async function uploadToCloudinary(buffer, filenameBase = 'line-image') {
 
   const timestamp = Math.floor(Date.now() / 1000);
   const publicId = `${CLOUDINARY_FOLDER}/${filenameBase}-${Date.now()}`;
-
   const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
 
-  const params = {
-    folder: CLOUDINARY_FOLDER,
-    public_id: publicId,
-    timestamp,
-  };
-
+  const params = { folder: CLOUDINARY_FOLDER, public_id: publicId, timestamp };
   const signature = cloudinarySign(params, CLOUDINARY_API_SECRET);
 
   const form = new FormData();
@@ -256,9 +241,7 @@ async function createActionFollowUp(taskText) {
   return notion.pages.create({
     parent: { database_id: NOTION_ACTION_DB_ID },
     properties: {
-      [ACTION_PROP_TASK_TITLE]: {
-        title: [{ text: { content: taskText } }],
-      },
+      [ACTION_PROP_TASK_TITLE]: { title: [{ text: { content: taskText } }] },
       Scope: { select: { name: 'Line' } },
       'Action Type': { select: { name: 'Follow up' } },
       Owner: { multi_select: [{ name: 'Stacy' }] },
@@ -268,15 +251,10 @@ async function createActionFollowUp(taskText) {
 }
 
 async function getTopTasksByStatus(statusName, limit = 5) {
-  const queryLimit = 30;
-
   const resp = await notion.databases.query({
     database_id: NOTION_ACTION_DB_ID,
-    page_size: queryLimit,
-    filter: {
-      property: ACTION_PROP_STATUS,
-      status: { equals: statusName },
-    },
+    page_size: 30,
+    filter: { property: ACTION_PROP_STATUS, status: { equals: statusName } },
   });
 
   const pages = resp?.results || [];
@@ -302,14 +280,10 @@ async function countByStatus(statusNames) {
         database_id: NOTION_ACTION_DB_ID,
         page_size: 100,
         start_cursor: cursor,
-        filter: {
-          property: ACTION_PROP_STATUS,
-          status: { equals: statusName },
-        },
+        filter: { property: ACTION_PROP_STATUS, status: { equals: statusName } },
       });
 
       total += (resp?.results || []).length;
-
       if (!resp?.has_more) break;
       cursor = resp?.next_cursor;
       if (!cursor) break;
@@ -326,9 +300,7 @@ async function searchActionTasks(keyword, limit = 5) {
     page_size: 20,
     filter: {
       property: ACTION_PROP_TASK_TITLE,
-      title: {
-        contains: keyword,
-      },
+      title: { contains: keyword },
     },
   });
 
@@ -340,12 +312,8 @@ async function searchActionTasks(keyword, limit = 5) {
 // ========= Notion Inbox =========
 function buildInboxPropsBase({ itemTitle, rawText, url, files }) {
   const props = {
-    [INBOX_PROP_TITLE]: {
-      title: [{ text: { content: itemTitle } }],
-    },
-    [INBOX_PROP_RAW]: rawText
-      ? { rich_text: [{ text: { content: rawText } }] }
-      : { rich_text: [] },
+    [INBOX_PROP_TITLE]: { title: [{ text: { content: itemTitle } }] },
+    [INBOX_PROP_RAW]: rawText ? { rich_text: [{ text: { content: rawText } }] } : { rich_text: [] },
     [INBOX_PROP_SOURCE]: { select: { name: 'Line' } },
   };
 
@@ -367,18 +335,12 @@ function buildInboxPropsBase({ itemTitle, rawText, url, files }) {
 async function createInboxTextItem(text) {
   const url = extractFirstUrl(text);
   let title = null;
-
   if (url) title = await fetchTitle(url);
 
   const itemTitle = title || safePreview(text, 60);
 
   const properties = pickExistingInboxProps(
-    buildInboxPropsBase({
-      itemTitle,
-      rawText: text,
-      url,
-      files: [],
-    })
+    buildInboxPropsBase({ itemTitle, rawText: text, url, files: [] })
   );
 
   return notion.pages.create({
@@ -388,11 +350,9 @@ async function createInboxTextItem(text) {
 }
 
 async function createInboxImageItem({ imageUrl, rawNote }) {
-  const itemTitle = `Image`;
-
   const properties = pickExistingInboxProps(
     buildInboxPropsBase({
-      itemTitle,
+      itemTitle: 'Image',
       rawText: rawNote,
       url: null,
       files: imageUrl ? [{ name: 'image', url: imageUrl }] : [],
@@ -424,9 +384,13 @@ function buildHelpText() {
     '/list Waiting- customer',
     '/list In progress',
     '',
+    'Buttons:',
+    '➕ Follow up → 進入輸入模式（下一則訊息會建立 follow up）',
+    '🔍 Search Action → 進入輸入模式（下一則訊息會搜尋）',
+    '',
     'Non-command:',
     '- 直接打字/分享連結 → 進 INBOX（自動抓 URL→URL 欄位）',
-    '- 傳圖片 → 進 INBOX（有 Cloudinary 才能寫入 Attachment 檔案欄位）',
+    '- 傳圖片 → 進 INBOX（有 Cloudinary 才能寫入 Attachment）',
   ].join('\n');
 }
 
@@ -435,7 +399,6 @@ async function handleListCommand(replyToken, fullText) {
 
   if (args.length === 1) {
     const statuses = ['open', 'Waiting- internal', 'Waiting- customer', 'In progress'];
-
     try {
       const counts = await countByStatus(statuses);
       const lines = statuses.map((s) => `${s}: ${counts[s] ?? 0}`);
@@ -469,20 +432,66 @@ async function handleListCommand(replyToken, fullText) {
 async function handleTextMessage(event) {
   const replyToken = event.replyToken;
   const text = (event.message?.text || '').trim();
+  const userId = event?.source?.userId || '';
 
   if (!text) return replyText(replyToken, '收到空白訊息，未寫入。');
 
-  // help
-  if (text === '/help' || text === '/h') {
+  // ---- Mode switch by buttons ----
+  if (text === '/followup') {
+    setMode(userId, 'FOLLOWUP');
+    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
+  }
+
+  if (text === '/search') {
+    setMode(userId, 'SEARCH');
+    return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
+  }
+
+  if (text === '/cancel') {
+    setMode(userId, null);
+    return replyText(replyToken, '已取消輸入模式。');
+  }
+
+  // ---- If user is in a mode, consume this message ----
+  const mode = getMode(userId);
+  if (mode === 'FOLLOWUP') {
+    setMode(userId, null);
+    try {
+      await createActionFollowUp(text);
+      return replyText(replyToken, `已記錄到 Action DB：${safePreview(text, 80)}`);
+    } catch (e) {
+      console.error('Notion write error (Action DB):', e);
+      return replyText(replyToken, '寫入 Action DB 失敗（請看 logs）。');
+    }
+  }
+
+  if (mode === 'SEARCH') {
+    setMode(userId, null);
+    const keyword = text.trim();
+    if (!keyword) return replyText(replyToken, '請輸入關鍵字。');
+
+    try {
+      const pages = await searchActionTasks(keyword, 5);
+      if (!pages.length) return replyText(replyToken, `找不到「${keyword}」相關 Task。`);
+
+      const lines = pages.map((p, idx) => {
+        const title = getTaskTitle(p) || '(無標題)';
+        const due = formatDueDate(p?.properties?.[ACTION_PROP_DUE]);
+        return due ? `${idx + 1}. ${title} (${due})` : `${idx + 1}. ${title}`;
+      });
+
+      return replyText(replyToken, [`搜尋「${keyword}」前 5 筆：`, ...lines].join('\n'));
+    } catch (e) {
+      console.error('Action search error:', e);
+      return replyText(replyToken, '搜尋 Action DB 失敗（請看 logs）。');
+    }
+  }
+
+  // ---- Regular commands ----
+  if (text === '/help' || text === '/h' || text === '/f') {
     return replyText(replyToken, buildHelpText());
   }
 
-  // /f (show help)
-  if (text === '/f') {
-    return replyText(replyToken, buildHelpText());
-  }
-
-  // /f <task>
   if (text.startsWith('/f ')) {
     const taskText = text.replace(/^\/f\s*/i, '').trim();
     if (!taskText) return replyText(replyToken, '用法：/f <要追蹤的事項>');
@@ -496,7 +505,6 @@ async function handleTextMessage(event) {
     }
   }
 
-  // ? keyword search Action DB
   if (text.startsWith('?')) {
     const keyword = text.replace(/^\?\s*/i, '').trim();
     if (!keyword) return replyText(replyToken, '用法：? <關鍵字>');
@@ -518,12 +526,11 @@ async function handleTextMessage(event) {
     }
   }
 
-  // /list ...
   if (text === '/list' || text.startsWith('/list ')) {
     return handleListCommand(replyToken, text);
   }
 
-  // Non-command → INBOX
+  // ---- Non-command default → INBOX ----
   try {
     await createInboxTextItem(text);
     return replyText(replyToken, `已收進 INBOX：${safePreview(text, 60)}`);
@@ -555,13 +562,8 @@ async function handleImageMessage(event) {
 
     await createInboxImageItem({ imageUrl: publicUrl, rawNote });
 
-    if (publicUrl) {
-      return replyText(replyToken, '已收進 INBOX（含 Attachment 圖片檔）。');
-    }
-    return replyText(
-      replyToken,
-      '已收進 INBOX（但 Attachment 需要 Cloudinary 才能寫入公開檔案 URL）。'
-    );
+    if (publicUrl) return replyText(replyToken, '已收進 INBOX（含 Attachment 圖片檔）。');
+    return replyText(replyToken, '已收進 INBOX（Attachment 需要 Cloudinary 才能寫入公開檔案 URL）。');
   } catch (e) {
     console.error('Notion/LINE image handling error:', e);
     return replyText(replyToken, '圖片寫入 INBOX 失敗（請看 logs）。');
@@ -572,13 +574,11 @@ async function handleNonTextMessage(event) {
   const replyToken = event.replyToken;
   const type = event.message?.type || 'unknown';
   const messageId = event.message?.id || '';
-
   const rawText = `[${type}]\nmessageId=${messageId}`;
 
   try {
-    const itemTitle = `${type}`;
     const properties = pickExistingInboxProps(
-      buildInboxPropsBase({ itemTitle, rawText, url: null, files: [] })
+      buildInboxPropsBase({ itemTitle: `${type}`, rawText, url: null, files: [] })
     );
 
     await notion.pages.create({
