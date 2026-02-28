@@ -28,9 +28,9 @@ if (!NOTION_INBOX_DB_ID) throw new Error('no notion inbox db id');
 // ========= Notion property names =========
 // Action DB
 const ACTION_PROP_TASK_TITLE = 'Task';
-const ACTION_PROP_STATUS = 'Status';           // status property
-const ACTION_PROP_PRIORITY = 'Priority Level'; // select
-const ACTION_PROP_DUE = 'Due date';            // date
+const ACTION_PROP_STATUS = 'Status';
+const ACTION_PROP_PRIORITY = 'Priority Level';
+const ACTION_PROP_DUE = 'Due date';
 
 // Inbox DB
 const INBOX_PROP_TITLE = 'Item';        // title
@@ -47,7 +47,7 @@ const lineConfig = {
 const lineClient = new line.Client(lineConfig);
 const notion = new NotionClient({ auth: NOTION_TOKEN });
 
-// ========= Optional: Cloudinary (for public image URL) =========
+// ========= Optional: Cloudinary =========
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
@@ -56,7 +56,7 @@ const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'line-notion-bot';
 const CLOUDINARY_ENABLED =
   !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY && !!CLOUDINARY_API_SECRET;
 
-// ========= DB schema cache (avoid Notion 400 when property doesn't exist) =========
+// ========= DB schema cache =========
 let inboxDbProps = null;
 
 async function loadInboxDbSchema() {
@@ -76,7 +76,6 @@ function pickExistingInboxProps(props) {
 }
 
 // ========= Simple per-user mode state (in-memory) =========
-// NOTE: Render restart will clear it. If you want persistence, we can store it in Notion/Redis later.
 const userMode = new Map(); // key: userId, value: {mode:'FOLLOWUP'|'SEARCH', ts:number}
 
 function setMode(userId, mode) {
@@ -174,35 +173,192 @@ function normalizeStatusArg(raw) {
   return (raw || '').trim();
 }
 
-// ========= Quick Reply =========
-// Quick Reply message action WILL SEND immediately.
-// We use it as "mode switch" rather than "prefill input".
-function getQuickReply() {
-  return {
-    items: [
-      { type: 'action', action: { type: 'message', label: '➕ Follow up', text: '/followup' } },
-      { type: 'action', action: { type: 'message', label: '🔍 Search Action', text: '/search' } },
-      { type: 'action', action: { type: 'message', label: '📊 List Count', text: '/list' } },
-      { type: 'action', action: { type: 'message', label: '📂 Open', text: '/list open' } },
-      { type: 'action', action: { type: 'message', label: '⏳ Waiting-Internal', text: '/list Waiting- internal' } },
-      { type: 'action', action: { type: 'message', label: '📞 Waiting-Customer', text: '/list Waiting- customer' } },
-      { type: 'action', action: { type: 'message', label: '🚧 In progress', text: '/list In progress' } },
-      { type: 'action', action: { type: 'message', label: '❌ Cancel', text: '/cancel' } },
-      { type: 'action', action: { type: 'message', label: 'ℹ️ Help', text: '/help' } },
-    ],
-  };
-}
-
+// ========= Reply helpers =========
 async function replyText(replyToken, text) {
   if (!replyToken) return;
+  return lineClient.replyMessage(replyToken, { type: 'text', text });
+}
+
+async function replyFlex(replyToken, altText, contents) {
+  if (!replyToken) return;
   return lineClient.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply: getQuickReply(),
+    type: 'flex',
+    altText: altText || 'Menu',
+    contents,
   });
 }
 
-// ========= Cloudinary upload (optional) =========
+function pb(dataObj) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(dataObj)) params.set(k, String(v));
+  // LINE postback data limit exists; keep it short
+  return params.toString();
+}
+
+function parsePostbackData(data) {
+  const params = new URLSearchParams(data || '');
+  const obj = {};
+  for (const [k, v] of params.entries()) obj[k] = v;
+  return obj;
+}
+
+// ========= Flex Menus =========
+function flexMainMenu() {
+  return {
+    type: 'bubble',
+    size: 'mega',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: 'LINE → Notion', weight: 'bold', size: 'xl' },
+        { type: 'text', text: '選擇要操作的資料庫', size: 'sm', color: '#666666', wrap: true },
+        { type: 'separator', margin: 'md' },
+
+        {
+          type: 'button',
+          style: 'primary',
+          action: { type: 'postback', label: 'Action DB', data: pb({ nav: 'action' }) },
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: 'Inbox DB', data: pb({ nav: 'inbox' }) },
+        },
+
+        // placeholders for future DBs
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: '（預留）DB-3', data: pb({ nav: 'db3' }) },
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: '（預留）DB-4', data: pb({ nav: 'db4' }) },
+        },
+
+        { type: 'separator', margin: 'md' },
+        {
+          type: 'button',
+          style: 'link',
+          action: { type: 'postback', label: 'Help', data: pb({ act: 'help' }) },
+        },
+      ],
+    },
+  };
+}
+
+function flexActionMenu() {
+  return {
+    type: 'bubble',
+    size: 'mega',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: 'Action DB', weight: 'bold', size: 'xl' },
+        { type: 'text', text: '選擇動作', size: 'sm', color: '#666666' },
+        { type: 'separator', margin: 'md' },
+
+        {
+          type: 'button',
+          style: 'primary',
+          action: { type: 'postback', label: 'List Count', data: pb({ act: 'list_count' }) },
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: 'List Top 5 (by status)', data: pb({ nav: 'status_menu' }) },
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: 'Follow up (新增)', data: pb({ act: 'followup_start' }) },
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: 'Search Action (搜尋)', data: pb({ act: 'search_start' }) },
+        },
+
+        { type: 'separator', margin: 'md' },
+        {
+          type: 'button',
+          style: 'link',
+          action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) },
+        },
+      ],
+    },
+  };
+}
+
+function flexStatusMenu() {
+  const statuses = [
+    { label: 'Open', value: 'open' },
+    { label: 'Waiting- internal', value: 'Waiting- internal' },
+    { label: 'Waiting- customer', value: 'Waiting- customer' },
+    { label: 'In progress', value: 'In progress' },
+  ];
+
+  return {
+    type: 'bubble',
+    size: 'mega',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: 'List Top 5', weight: 'bold', size: 'xl' },
+        { type: 'text', text: '選擇 Status', size: 'sm', color: '#666666' },
+        { type: 'separator', margin: 'md' },
+        ...statuses.map((s) => ({
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: s.label, data: pb({ act: 'list_status', status: s.value }) },
+        })),
+        { type: 'separator', margin: 'md' },
+        {
+          type: 'button',
+          style: 'link',
+          action: { type: 'postback', label: 'Back', data: pb({ nav: 'action' }) },
+        },
+      ],
+    },
+  };
+}
+
+function flexInboxMenu() {
+  return {
+    type: 'bubble',
+    size: 'mega',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: 'Inbox DB', weight: 'bold', size: 'xl' },
+        { type: 'text', text: '目前 Inbox 是「直接打字/分享連結/傳圖」自動寫入', size: 'sm', color: '#666666', wrap: true },
+        { type: 'separator', margin: 'md' },
+        {
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: '說明（如何寫入）', data: pb({ act: 'inbox_help' }) },
+        },
+        { type: 'separator', margin: 'md' },
+        {
+          type: 'button',
+          style: 'link',
+          action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) },
+        },
+      ],
+    },
+  };
+}
+
+// ========= Cloudinary upload =========
 function cloudinarySign(paramsToSign, apiSecret) {
   const keys = Object.keys(paramsToSign).sort();
   const toSign = keys
@@ -373,24 +529,20 @@ async function fetchLineMessageContentBuffer(messageId) {
   return Buffer.concat(chunks);
 }
 
-// ========= Commands =========
+// ========= Commands text =========
 function buildHelpText() {
   return [
-    'Commands:',
-    '/f <內容>  → 新增 Follow up 到 Action DB（Status=OPEN）',
-    '? <關鍵字> → 搜尋 Action DB（Task contains），回傳前 5 筆（含 Due date）',
-    '/list      → 列出每個 status 的數量',
+    'Commands (backup):',
+    '/menu       → 打開選單（Flex）',
+    '/f <內容>   → 新增 Follow up 到 Action DB（Status=OPEN）',
+    '? <關鍵字>  → 搜尋 Action DB（Task contains），回傳前 5 筆（含 Due date）',
+    '/list       → 列出每個 status 的數量',
     '/list open',
     '/list Waiting- internal',
     '/list Waiting- customer',
     '/list In progress',
     '',
-    'Buttons:',
-    '➕ Follow up → 進入輸入模式（下一則訊息會建立 follow up）',
-    '🔍 Search Action → 進入輸入模式（下一則訊息會搜尋）',
-    '❌ Cancel → 取消輸入模式',
-    '',
-    'Non-command:',
+    'Inbox:',
     '- 直接打字/分享連結 → 進 INBOX（自動抓 URL→URL 欄位）',
     '- 傳圖片 → 進 INBOX（有 Cloudinary 才能寫入 Attachment）',
   ].join('\n');
@@ -430,6 +582,77 @@ async function handleListCommand(replyToken, fullText) {
   }
 }
 
+// ========= Postback handler =========
+async function handlePostback(event) {
+  const replyToken = event.replyToken;
+  const userId = event?.source?.userId || '';
+  const data = parsePostbackData(event.postback?.data || '');
+
+  console.log('[POSTBACK]', data);
+
+  // navigation
+  if (data.nav === 'main') return replyFlex(replyToken, 'Main menu', flexMainMenu());
+  if (data.nav === 'action') return replyFlex(replyToken, 'Action menu', flexActionMenu());
+  if (data.nav === 'status_menu') return replyFlex(replyToken, 'Status menu', flexStatusMenu());
+  if (data.nav === 'inbox') return replyFlex(replyToken, 'Inbox menu', flexInboxMenu());
+  if (data.nav === 'db3') return replyText(replyToken, 'DB-3 尚未接上（之後你給我 DB ID/欄位就能加）。');
+  if (data.nav === 'db4') return replyText(replyToken, 'DB-4 尚未接上（之後你給我 DB ID/欄位就能加）。');
+
+  // actions
+  if (data.act === 'help') return replyText(replyToken, buildHelpText());
+
+  if (data.act === 'inbox_help') {
+    return replyText(
+      replyToken,
+      ['Inbox DB：', '- 直接打字/分享連結會自動寫入', '- 傳圖片也會寫入（Attachment 需 Cloudinary）', '- 如要做 Inbox 查詢/分類，之後可加在這裡'].join('\n')
+    );
+  }
+
+  if (data.act === 'list_count') {
+    const statuses = ['open', 'Waiting- internal', 'Waiting- customer', 'In progress'];
+    try {
+      const counts = await countByStatus(statuses);
+      const lines = statuses.map((s) => `${s}: ${counts[s] ?? 0}`);
+      return replyText(replyToken, ['Status count:', ...lines].join('\n'));
+    } catch (e) {
+      console.error('List count error:', e);
+      return replyText(replyToken, '讀取統計失敗（請看 logs）。');
+    }
+  }
+
+  if (data.act === 'list_status') {
+    const status = normalizeStatusArg(data.status || '');
+    if (!status) return replyText(replyToken, '缺少 status 參數。');
+    try {
+      const pages = await getTopTasksByStatus(status, 5);
+      if (!pages.length) return replyText(replyToken, `「${status}」沒有資料。`);
+
+      const lines = pages.map((p, idx) => {
+        const title = getTaskTitle(p) || '(無標題)';
+        const due = formatDueDate(p?.properties?.[ACTION_PROP_DUE]);
+        return due ? `${idx + 1}. ${title} (${due})` : `${idx + 1}. ${title}`;
+      });
+
+      return replyText(replyToken, [`${status} top 5:`, ...lines].join('\n'));
+    } catch (e) {
+      console.error('List status error:', e);
+      return replyText(replyToken, '讀取清單失敗（請看 logs）。');
+    }
+  }
+
+  if (data.act === 'followup_start') {
+    setMode(userId, 'FOLLOWUP');
+    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
+  }
+
+  if (data.act === 'search_start') {
+    setMode(userId, 'SEARCH');
+    return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
+  }
+
+  return replyText(replyToken, '未識別的操作（請用 /menu 重新開啟選單）。');
+}
+
 // ========= LINE Handlers =========
 async function handleTextMessage(event) {
   const replyToken = event.replyToken;
@@ -438,27 +661,17 @@ async function handleTextMessage(event) {
 
   if (!text) return replyText(replyToken, '收到空白訊息，未寫入。');
 
-  // ---- Mode switch by buttons ----
-  if (text === '/followup') {
-    setMode(userId, 'FOLLOWUP');
-    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
-  }
+  // Flex menu entry
+  if (text === '/menu') return replyFlex(replyToken, 'Main menu', flexMainMenu());
 
-  if (text === '/search') {
-    setMode(userId, 'SEARCH');
-    return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
-  }
+  // backup commands
+  if (text === '/help' || text === '/h') return replyText(replyToken, buildHelpText());
 
-  if (text === '/cancel') {
-    setMode(userId, null);
-    return replyText(replyToken, '已取消輸入模式。');
-  }
-
-  // ---- If user is in a mode, consume this message ----
+  // consume mode
   const mode = getMode(userId);
-
-  // ✅ Guard: if user shares a URL while in mode, treat as INBOX and cancel mode
   const maybeUrl = extractFirstUrl(text);
+
+  // if user shares URL while in mode, treat as INBOX and cancel mode
   if (mode && maybeUrl) {
     setMode(userId, null);
     try {
@@ -503,10 +716,8 @@ async function handleTextMessage(event) {
     }
   }
 
-  // ---- Regular commands ----
-  if (text === '/help' || text === '/h' || text === '/f') {
-    return replyText(replyToken, buildHelpText());
-  }
+  // legacy: /f
+  if (text === '/f') return replyText(replyToken, buildHelpText());
 
   if (text.startsWith('/f ')) {
     const taskText = text.replace(/^\/f\s*/i, '').trim();
@@ -521,6 +732,7 @@ async function handleTextMessage(event) {
     }
   }
 
+  // legacy: ?keyword
   if (text.startsWith('?')) {
     const keyword = text.replace(/^\?\s*/i, '').trim();
     if (!keyword) return replyText(replyToken, '用法：? <關鍵字>');
@@ -542,11 +754,12 @@ async function handleTextMessage(event) {
     }
   }
 
+  // legacy: /list
   if (text === '/list' || text.startsWith('/list ')) {
     return handleListCommand(replyToken, text);
   }
 
-  // ---- Non-command default → INBOX ----
+  // default → INBOX
   try {
     await createInboxTextItem(text);
     return replyText(replyToken, `已收進 INBOX：${safePreview(text, 60)}`);
@@ -611,19 +824,20 @@ async function handleNonTextMessage(event) {
 
 async function handleEvent(event) {
   try {
-    // debug: see what LINE actually sends for share
     console.log('[EVENT]', {
       type: event.type,
       msgType: event.message?.type,
-      textPreview: (event.message?.text || '').slice(0, 80),
+      hasPostback: !!event.postback,
+      textLen: (event.message?.text || '').length,
+      textPreview: (event.message?.text || '').slice(0, 120),
     });
 
-   if (event.type !== 'message') {
-  if (event.replyToken) {
-    return replyText(event.replyToken, `收到非 message event: ${event.type}`);
-  }
-  return null;
-}
+    if (event.type === 'postback') return handlePostback(event);
+
+    if (event.type !== 'message') {
+      // keep quiet for non-message events
+      return null;
+    }
 
     const msgType = event.message?.type;
 
@@ -646,7 +860,11 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   res.sendStatus(200);
 
   console.log('[WEBHOOK HIT] at', new Date().toISOString());
-  console.log('[WEBHOOK HEADERS]', req.headers['user-agent'], req.headers['x-line-signature'] ? 'has-signature' : 'no-signature');
+  console.log(
+    '[WEBHOOK HEADERS]',
+    req.headers['user-agent'],
+    req.headers['x-line-signature'] ? 'has-signature' : 'no-signature'
+  );
 
   const events = req.body?.events || [];
   console.log('LINE events:', events.map((e) => `${e.type}:${e.message?.type || ''}`));
