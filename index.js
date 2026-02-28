@@ -11,10 +11,7 @@ const lineConfig = {
 };
 
 // ===== NOTION CONFIG =====
-const notion = new Client({
-  auth: process.env.NOTION_TOKEN,
-});
-
+const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const ACTION_DB = process.env.NOTION_ACTION_DB_ID;
 
 // ===== HEALTH CHECK =====
@@ -22,74 +19,77 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ===== WEBHOOK =====
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
+  // LINE 要求快速回 200
   res.status(200).send("OK");
 
   const events = req.body.events || [];
 
   for (const event of events) {
     if (event.type !== "message") continue;
-    if (event.message.type !== "text") continue;
+    if (!event.message || event.message.type !== "text") continue;
 
-    const text = event.message.text.trim();
+    const rawText = (event.message.text || "").trim();
 
-    // Only process commands starting with /
-    if (!text.startsWith("/")) continue;
+    // 你目前用 /f 來代表 Follow up（也可擴充其他指令）
+    if (!rawText.startsWith("/f")) continue;
+
+    const taskText = rawText.replace("/f", "").trim();
+    if (!taskText) continue;
 
     try {
-      await handleCommand(text, event.source.userId);
+      await createActionInNotion({
+        taskText,
+      });
+      console.log("Notion created:", taskText);
     } catch (err) {
-      console.error("Notion write error:", err);
+      console.error("Notion write error:", err?.body || err);
     }
   }
 });
 
-// ===== COMMAND HANDLER =====
-async function handleCommand(text, userId) {
-  let type = "General";
-  let content = text;
-
-  if (text.startsWith("/f")) {
-    type = "Follow";
-    content = text.replace("/f", "").trim();
-  } else if (text.startsWith("/d")) {
-    type = "Delegate";
-    content = text.replace("/d", "").trim();
-  } else if (text.startsWith("/r")) {
-    type = "Reference";
-    content = text.replace("/r", "").trim();
-  }
-
-  await notion.pages.create({
+// ===== NOTION WRITE =====
+async function createActionInNotion({ taskText }) {
+  // 這裡完全對應你 Action DB 的欄位名稱與選項
+  return notion.pages.create({
     parent: { database_id: ACTION_DB },
     properties: {
-      Title: {
+      // Title 欄位（你叫 TASK）
+      TASK: {
         title: [
           {
-            text: {
-              content: content,
-            },
+            text: { content: taskText },
           },
         ],
       },
-      Type: {
-        select: { name: type },
+
+      // Select: Scope -> Line
+      Scope: {
+        select: { name: "Line" },
       },
-      Source: {
-        select: { name: "LINE" },
+
+      // Select: Action Type -> Follow up
+      "Action Type": {
+        select: { name: "Follow up" },
       },
-      User: {
-        rich_text: [
-          {
-            text: { content: userId || "unknown" },
-          },
-        ],
+
+      // Multi-select: Owner -> Stacy
+      Owner: {
+        multi_select: [{ name: "Stacy" }],
       },
+
+      // Select: Status -> OPEN
       Status: {
-        select: { name: "New" },
+        select: { name: "OPEN" },
       },
     },
   });
 }
+
+// ===== ERROR HANDLER (avoid 502) =====
+app.use((err, req, res, next) => {
+  console.error("Express error:", err);
+  res.status(200).send("OK");
+});
 
 const port = process.env.PORT || 8888;
 app.listen(port, "0.0.0.0", () => {
