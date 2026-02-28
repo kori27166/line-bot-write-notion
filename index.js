@@ -1,24 +1,5 @@
 'use strict';
 
-/**
- * Line ↔ Notion Bot (deploy-ready)
- *
- * Features
- * - Quick Reply menu (commands)
- * - /f <text> → create Follow up in Action DB (Status=OPEN)
- * - /list → status counts
- * - /list <status> → top 5 tasks by Priority Level (desc), show Task + Due date
- * - Non-command text → write to INBOX DB
- * - Auto parse URL into Notion URL property
- * - Auto add Today date into Notion date property
- * - Image message → store into Notion Files property (requires image hosting)
- *
- * IMPORTANT about image → Notion file:
- * Notion API "files" property requires a PUBLIC URL. LINE content API URLs are not public.
- * So this code supports optional Cloudinary upload (recommended).
- * If Cloudinary env vars are missing, it will still write to INBOX but attachment will be skipped.
- */
-
 require('dotenv').config();
 
 const express = require('express');
@@ -44,20 +25,19 @@ if (!NOTION_TOKEN) throw new Error('no notion token');
 if (!NOTION_ACTION_DB_ID) throw new Error('no notion action db id');
 if (!NOTION_INBOX_DB_ID) throw new Error('no notion inbox db id');
 
-// ========= Notion property names (change here if your DB uses different names) =========
+// ========= Notion property names =========
 // Action DB
 const ACTION_PROP_TASK_TITLE = 'Task';
-const ACTION_PROP_STATUS = 'Status'; // Notion "status" property
-const ACTION_PROP_PRIORITY = 'Priority Level'; // select
-const ACTION_PROP_DUE = 'Due date'; // date
+const ACTION_PROP_STATUS = 'Status';          // status property
+const ACTION_PROP_PRIORITY = 'Priority Level';// select
+const ACTION_PROP_DUE = 'Due date';           // date
 
 // Inbox DB
-const INBOX_PROP_TITLE = 'Item';     // title
-const INBOX_PROP_RAW = '原文';       // rich_text
-const INBOX_PROP_URL = 'URL';        // url
-const INBOX_PROP_SOURCE = 'Source';  // select
-const INBOX_PROP_DATE = 'Date';      // date (auto set to today)
-const INBOX_PROP_FILES = 'Attachment'; // files (optional)
+const INBOX_PROP_TITLE = 'Item';        // title
+const INBOX_PROP_RAW = '原文';          // rich_text
+const INBOX_PROP_URL = 'URL';           // url
+const INBOX_PROP_SOURCE = 'Source';     // select
+const INBOX_PROP_FILES = 'Attachment';  // files (optional)
 
 // ========= Clients =========
 const lineConfig = {
@@ -67,7 +47,7 @@ const lineConfig = {
 const lineClient = new line.Client(lineConfig);
 const notion = new NotionClient({ auth: NOTION_TOKEN });
 
-// ========= Optional: Cloudinary upload for images =========
+// ========= Optional: Cloudinary (for public image URL) =========
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
@@ -76,16 +56,26 @@ const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'line-notion-bot';
 const CLOUDINARY_ENABLED =
   !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY && !!CLOUDINARY_API_SECRET;
 
-// ========= Helpers =========
-function todayYYYYMMDD() {
-  // Asia/Taipei safe-enough for day-level property; adjust if you need strict TZ handling
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const dd = String(now.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+// ========= DB schema cache (avoid Notion 400 when property doesn't exist) =========
+let inboxDbProps = null;
+
+async function loadInboxDbSchema() {
+  const db = await notion.databases.retrieve({ database_id: NOTION_INBOX_DB_ID });
+  inboxDbProps = db?.properties || {};
+  console.log('[INBOX DB] props:', Object.keys(inboxDbProps));
 }
 
+function pickExistingInboxProps(props) {
+  if (!inboxDbProps) return props;
+  const filtered = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined) continue;
+    if (inboxDbProps[k]) filtered[k] = v;
+  }
+  return filtered;
+}
+
+// ========= Helpers =========
 function safePreview(text, maxLen = 60) {
   const t = (text || '').trim().replace(/\s+/g, ' ');
   if (t.length <= maxLen) return t;
@@ -154,7 +144,6 @@ function getTaskTitle(page) {
 function getPriorityRank(page) {
   const p = page?.properties?.[ACTION_PROP_PRIORITY];
   const name = p?.select?.name || '';
-  // customize mapping if your priority values differ
   const map = {
     High: 3,
     Medium: 2,
@@ -168,13 +157,17 @@ function getPriorityRank(page) {
 }
 
 function normalizeStatusArg(raw) {
-  // allow user input variants; keep as-is mostly (Notion status names must match exactly)
   return (raw || '').trim();
 }
 
+// ========= Quick Reply =========
 function getQuickReply() {
   return {
     items: [
+      {
+        type: 'action',
+        action: { type: 'message', label: '➕ Follow up', text: '/f ' },
+      },
       {
         type: 'action',
         action: { type: 'message', label: '📊 List Count', text: '/list' },
@@ -214,7 +207,6 @@ async function replyText(replyToken, text) {
 
 // ========= Cloudinary upload (optional) =========
 function cloudinarySign(paramsToSign, apiSecret) {
-  // signature = sha1(param1=value1&param2=value2... + api_secret)
   const keys = Object.keys(paramsToSign).sort();
   const toSign = keys
     .filter((k) => paramsToSign[k] !== undefined && paramsToSign[k] !== null && paramsToSign[k] !== '')
@@ -229,8 +221,6 @@ async function uploadToCloudinary(buffer, filenameBase = 'line-image') {
   const timestamp = Math.floor(Date.now() / 1000);
   const publicId = `${CLOUDINARY_FOLDER}/${filenameBase}-${Date.now()}`;
 
-  // Use unsigned? No, we do signed upload via API key/secret.
-  // Endpoint: https://api.cloudinary.com/v1_1/<cloud_name>/image/upload
   const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
 
   const params = {
@@ -253,7 +243,6 @@ async function uploadToCloudinary(buffer, filenameBase = 'line-image') {
   if (!resp.ok) return null;
 
   const json = await resp.json();
-  // secure_url should be public
   return json?.secure_url || json?.url || null;
 }
 
@@ -274,7 +263,6 @@ async function createActionFollowUp(taskText) {
 }
 
 async function getTopTasksByStatus(statusName, limit = 5) {
-  // Pull more then sort by rank to ensure correct order
   const queryLimit = 30;
 
   const resp = await notion.databases.query({
@@ -290,7 +278,6 @@ async function getTopTasksByStatus(statusName, limit = 5) {
   pages.sort((a, b) => {
     const pr = getPriorityRank(b) - getPriorityRank(a);
     if (pr !== 0) return pr;
-    // optional tie-breaker: due date earlier first
     const da = a?.properties?.[ACTION_PROP_DUE]?.date?.start || '';
     const db = b?.properties?.[ACTION_PROP_DUE]?.date?.start || '';
     return da.localeCompare(db);
@@ -300,7 +287,6 @@ async function getTopTasksByStatus(statusName, limit = 5) {
 }
 
 async function countByStatus(statusNames) {
-  // Notion doesn't provide aggregation; we query counts per status with pagination
   const counts = {};
   for (const statusName of statusNames) {
     let total = 0;
@@ -335,20 +321,14 @@ function buildInboxPropsBase({ itemTitle, rawText, url, files }) {
     [INBOX_PROP_TITLE]: {
       title: [{ text: { content: itemTitle } }],
     },
-    [INBOX_PROP_RAW]: {
-      rich_text: rawText ? [{ text: { content: rawText } }] : [],
-    },
-    [INBOX_PROP_SOURCE]: {
-      select: { name: 'Line' },
-    },
-    [INBOX_PROP_DATE]: {
-      date: { start: todayYYYYMMDD() },
-    },
+    [INBOX_PROP_RAW]: rawText
+      ? { rich_text: [{ text: { content: rawText } }] }
+      : { rich_text: [] },
+    [INBOX_PROP_SOURCE]: { select: { name: 'Line' } },
   };
 
   if (url) props[INBOX_PROP_URL] = { url };
 
-  // Notion "files" needs array of { name, external: { url } }
   if (Array.isArray(files) && files.length > 0) {
     props[INBOX_PROP_FILES] = {
       files: files.map((f) => ({
@@ -370,28 +350,36 @@ async function createInboxTextItem(text) {
 
   const itemTitle = title || safePreview(text, 60);
 
-  return notion.pages.create({
-    parent: { database_id: NOTION_INBOX_DB_ID },
-    properties: buildInboxPropsBase({
+  const properties = pickExistingInboxProps(
+    buildInboxPropsBase({
       itemTitle,
       rawText: text,
       url,
       files: [],
-    }),
+    })
+  );
+
+  return notion.pages.create({
+    parent: { database_id: NOTION_INBOX_DB_ID },
+    properties,
   });
 }
 
 async function createInboxImageItem({ imageUrl, rawNote }) {
-  const itemTitle = `Image - ${todayYYYYMMDD()}`;
+  const itemTitle = `Image`;
 
-  return notion.pages.create({
-    parent: { database_id: NOTION_INBOX_DB_ID },
-    properties: buildInboxPropsBase({
+  const properties = pickExistingInboxProps(
+    buildInboxPropsBase({
       itemTitle,
       rawText: rawNote,
       url: null,
       files: imageUrl ? [{ name: 'image', url: imageUrl }] : [],
-    }),
+    })
+  );
+
+  return notion.pages.create({
+    parent: { database_id: NOTION_INBOX_DB_ID },
+    properties,
   });
 }
 
@@ -414,17 +402,15 @@ function buildHelpText() {
     '/list In progress',
     '',
     'Non-command:',
-    '- 直接打字 / 分享連結 → 進 INBOX（自動抓 URL → URL 欄位，Today → Date 欄位）',
-    '- 傳圖片 → 進 INBOX（需 Cloudinary 才能寫入 Attachment 檔案欄位）',
+    '- 直接打字/分享連結 → 進 INBOX（自動抓 URL→URL 欄位）',
+    '- 傳圖片 → 進 INBOX（有 Cloudinary 才能寫入 Attachment 檔案欄位）',
   ].join('\n');
 }
 
 async function handleListCommand(replyToken, fullText) {
   const args = fullText.split(' ').filter(Boolean);
 
-  // /list only → status counts
   if (args.length === 1) {
-    // Adjust statuses to exactly match your Notion status option names
     const statuses = ['open', 'Waiting- internal', 'Waiting- customer', 'In progress'];
 
     try {
@@ -437,7 +423,6 @@ async function handleListCommand(replyToken, fullText) {
     }
   }
 
-  // /list <status...>
   const status = normalizeStatusArg(fullText.replace(/^\/list\s*/i, ''));
 
   try {
@@ -534,7 +519,6 @@ async function handleImageMessage(event) {
 }
 
 async function handleNonTextMessage(event) {
-  // For file/video/audio/location/sticker: store a simple record to INBOX
   const replyToken = event.replyToken;
   const type = event.message?.type || 'unknown';
   const messageId = event.message?.id || '';
@@ -542,16 +526,16 @@ async function handleNonTextMessage(event) {
   const rawText = `[${type}]\nmessageId=${messageId}`;
 
   try {
-    const itemTitle = `${type} - ${todayYYYYMMDD()}`;
+    const itemTitle = `${type}`;
+    const properties = pickExistingInboxProps(
+      buildInboxPropsBase({ itemTitle, rawText, url: null, files: [] })
+    );
+
     await notion.pages.create({
       parent: { database_id: NOTION_INBOX_DB_ID },
-      properties: buildInboxPropsBase({
-        itemTitle,
-        rawText,
-        url: null,
-        files: [],
-      }),
+      properties,
     });
+
     return replyText(replyToken, `已收進 INBOX：${type}`);
   } catch (e) {
     console.error('Notion write error (INBOX non-text):', e);
@@ -581,7 +565,6 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
-  // respond quickly to prevent LINE timeout
   res.sendStatus(200);
 
   const events = req.body?.events || [];
@@ -593,7 +576,13 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 });
 
 // ========= Start =========
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log(`CLOUDINARY_ENABLED=${CLOUDINARY_ENABLED}`);
-});
+(async () => {
+  await loadInboxDbSchema();
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+    console.log(`CLOUDINARY_ENABLED=${CLOUDINARY_ENABLED}`);
+  });
+})().catch((e) => {
+  console.error('Startup error:', e);
+  process.exit(1);
+})();
