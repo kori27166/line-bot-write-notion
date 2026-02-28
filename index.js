@@ -1,10 +1,30 @@
 'use strict';
 
+/**
+ * Line ↔ Notion Bot (deploy-ready)
+ *
+ * Features
+ * - Quick Reply menu (commands)
+ * - /f <text> → create Follow up in Action DB (Status=OPEN)
+ * - /list → status counts
+ * - /list <status> → top 5 tasks by Priority Level (desc), show Task + Due date
+ * - Non-command text → write to INBOX DB
+ * - Auto parse URL into Notion URL property
+ * - Auto add Today date into Notion date property
+ * - Image message → store into Notion Files property (requires image hosting)
+ *
+ * IMPORTANT about image → Notion file:
+ * Notion API "files" property requires a PUBLIC URL. LINE content API URLs are not public.
+ * So this code supports optional Cloudinary upload (recommended).
+ * If Cloudinary env vars are missing, it will still write to INBOX but attachment will be skipped.
+ */
+
 require('dotenv').config();
 
 const express = require('express');
 const line = require('@line/bot-sdk');
 const { Client: NotionClient } = require('@notionhq/client');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -24,6 +44,21 @@ if (!NOTION_TOKEN) throw new Error('no notion token');
 if (!NOTION_ACTION_DB_ID) throw new Error('no notion action db id');
 if (!NOTION_INBOX_DB_ID) throw new Error('no notion inbox db id');
 
+// ========= Notion property names (change here if your DB uses different names) =========
+// Action DB
+const ACTION_PROP_TASK_TITLE = 'Task';
+const ACTION_PROP_STATUS = 'Status'; // Notion "status" property
+const ACTION_PROP_PRIORITY = 'Priority Level'; // select
+const ACTION_PROP_DUE = 'Due date'; // date
+
+// Inbox DB
+const INBOX_PROP_TITLE = 'Item';     // title
+const INBOX_PROP_RAW = '原文';       // rich_text
+const INBOX_PROP_URL = 'URL';        // url
+const INBOX_PROP_SOURCE = 'Source';  // select
+const INBOX_PROP_DATE = 'Date';      // date (auto set to today)
+const INBOX_PROP_FILES = 'Attachment'; // files (optional)
+
 // ========= Clients =========
 const lineConfig = {
   channelAccessToken: CHANNEL_ACCESS_TOKEN,
@@ -32,17 +67,39 @@ const lineConfig = {
 const lineClient = new line.Client(lineConfig);
 const notion = new NotionClient({ auth: NOTION_TOKEN });
 
+// ========= Optional: Cloudinary upload for images =========
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'line-notion-bot';
+
+const CLOUDINARY_ENABLED =
+  !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY && !!CLOUDINARY_API_SECRET;
+
 // ========= Helpers =========
+function todayYYYYMMDD() {
+  // Asia/Taipei safe-enough for day-level property; adjust if you need strict TZ handling
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function safePreview(text, maxLen = 60) {
+  const t = (text || '').trim().replace(/\s+/g, ' ');
+  if (t.length <= maxLen) return t;
+  return t.slice(0, maxLen) + '…';
+}
+
 function extractFirstUrl(text) {
   if (!text) return null;
   const m = text.match(/https?:\/\/[^\s]+/i);
   if (!m) return null;
-  // 去掉結尾常見標點
   return m[0].replace(/[)\].,!?;:]+$/g, '');
 }
 
 async function fetchTitle(url) {
-  // Node 22 有 global fetch
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
 
@@ -62,7 +119,6 @@ async function fetchTitle(url) {
     if (!contentType.toLowerCase().includes('text/html')) return null;
 
     const html = await resp.text();
-    // 粗抓 <title>，避免引入 parser
     const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
     if (!m) return null;
 
@@ -76,221 +132,443 @@ async function fetchTitle(url) {
       .trim();
 
     return title || null;
-  } catch (e) {
+  } catch {
     return null;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function safePreview(text, maxLen = 60) {
-  const t = (text || '').trim().replace(/\s+/g, ' ');
-  if (t.length <= maxLen) return t;
-  return t.slice(0, maxLen) + '…';
-}
-
 function formatDueDate(prop) {
-  // prop: Notion property object for date
   const d = prop?.date;
   if (!d?.start) return '';
-  // start could be "YYYY-MM-DD" or ISO datetime
   return d.start.slice(0, 10);
 }
 
-function getPriorityRank(page) {
-  // 你的 Action DB 欄位看起來叫 "Priority"（截圖顯示 Priority...）
-  // 若你實際欄位名不同，改成你的欄位名即可。
-  const p = page?.properties?.Priority;
-  const name = p?.select?.name || '';
-  const map = {
-    High: 3,
-    Medium: 2,
-    Low: 1,
-  };
-  return map[name] || 0;
-}
-
 function getTaskTitle(page) {
-  // 你的 Action DB title 欄位叫 Task（你已確認）
-  const t = page?.properties?.Task?.title;
+  const t = page?.properties?.[ACTION_PROP_TASK_TITLE]?.title;
   if (!Array.isArray(t) || t.length === 0) return '';
   return (t[0]?.plain_text || '').trim();
 }
 
-// ========= Notion Actions =========
-async function createActionFollowUp(taskText) {
-  // 依你給的欄位設定：
-  // Title 欄位：Task
-  // Scope select：Line
-  // Action Type select：Follow up
-  // Owner multi-select：Stacy
-  // Status（注意大小寫）欄位：Status（Notion 顯示是 Status）選項：OPEN
-  return notion.pages.create({
-    parent: { database_id: NOTION_ACTION_DB_ID },
-    properties: {
-      Task: {
-        title: [{ text: { content: taskText } }],
-      },
-      Scope: {
-        select: { name: 'Line' },
-      },
-      'Action Type': {
-        select: { name: 'Follow up' },
-      },
-      Owner: {
-        multi_select: [{ name: 'Stacy' }],
-      },
-      Status: {
-        status: { name: 'OPEN' },
-      },
-    },
-  });
+function getPriorityRank(page) {
+  const p = page?.properties?.[ACTION_PROP_PRIORITY];
+  const name = p?.select?.name || '';
+  // customize mapping if your priority values differ
+  const map = {
+    High: 3,
+    Medium: 2,
+    Low: 1,
+    P0: 4,
+    P1: 3,
+    P2: 2,
+    P3: 1,
+  };
+  return map[name] || 0;
 }
 
-async function searchActionTasks(keyword, limit = 5) {
-  // 先抓較多筆再在程式端做 priority sort（Notion select sort 不一定符合 High/Medium/Low）
-  const queryLimit = 20;
-
-  const resp = await notion.databases.query({
-    database_id: NOTION_ACTION_DB_ID,
-    page_size: queryLimit,
-    filter: {
-      property: 'Task',
-      title: {
-        contains: keyword,
-      },
-    },
-  });
-
-  const pages = resp?.results || [];
-  pages.sort((a, b) => getPriorityRank(b) - getPriorityRank(a));
-
-  return pages.slice(0, limit);
+function normalizeStatusArg(raw) {
+  // allow user input variants; keep as-is mostly (Notion status names must match exactly)
+  return (raw || '').trim();
 }
 
-// ========= Notion Inbox =========
-async function createInboxItem(text) {
-  const url = extractFirstUrl(text);
-  let title = null;
-
-  if (url) {
-    title = await fetchTitle(url);
-  }
-
-  const itemTitle = title || safePreview(text, 60);
-
-  // 依你 INBOX DB 欄位：
-  // Item (title), 原文 (rich_text), URL (url), Source (select: Line)
-  return notion.pages.create({
-    parent: { database_id: NOTION_INBOX_DB_ID },
-    properties: {
-      Item: {
-        title: [{ text: { content: itemTitle } }],
+function getQuickReply() {
+  return {
+    items: [
+      {
+        type: 'action',
+        action: { type: 'message', label: '📊 List Count', text: '/list' },
       },
-      原文: {
-        rich_text: [{ text: { content: text } }],
+      {
+        type: 'action',
+        action: { type: 'message', label: '📂 Open', text: '/list open' },
       },
-      URL: url ? { url } : undefined,
-      Source: {
-        select: { name: 'Line' },
+      {
+        type: 'action',
+        action: { type: 'message', label: '⏳ Waiting-Internal', text: '/list Waiting- internal' },
       },
-    },
-  });
+      {
+        type: 'action',
+        action: { type: 'message', label: '📞 Waiting-Customer', text: '/list Waiting- customer' },
+      },
+      {
+        type: 'action',
+        action: { type: 'message', label: '🚧 In progress', text: '/list In progress' },
+      },
+      {
+        type: 'action',
+        action: { type: 'message', label: 'ℹ️ Help', text: '/f' },
+      },
+    ],
+  };
 }
 
-// ========= LINE Handlers =========
 async function replyText(replyToken, text) {
   if (!replyToken) return;
   return lineClient.replyMessage(replyToken, {
     type: 'text',
     text,
+    quickReply: getQuickReply(),
   });
 }
 
+// ========= Cloudinary upload (optional) =========
+function cloudinarySign(paramsToSign, apiSecret) {
+  // signature = sha1(param1=value1&param2=value2... + api_secret)
+  const keys = Object.keys(paramsToSign).sort();
+  const toSign = keys
+    .filter((k) => paramsToSign[k] !== undefined && paramsToSign[k] !== null && paramsToSign[k] !== '')
+    .map((k) => `${k}=${paramsToSign[k]}`)
+    .join('&');
+  return crypto.createHash('sha1').update(toSign + apiSecret).digest('hex');
+}
+
+async function uploadToCloudinary(buffer, filenameBase = 'line-image') {
+  if (!CLOUDINARY_ENABLED) return null;
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const publicId = `${CLOUDINARY_FOLDER}/${filenameBase}-${Date.now()}`;
+
+  // Use unsigned? No, we do signed upload via API key/secret.
+  // Endpoint: https://api.cloudinary.com/v1_1/<cloud_name>/image/upload
+  const endpoint = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+
+  const params = {
+    folder: CLOUDINARY_FOLDER,
+    public_id: publicId,
+    timestamp,
+  };
+
+  const signature = cloudinarySign(params, CLOUDINARY_API_SECRET);
+
+  const form = new FormData();
+  form.append('file', new Blob([buffer]), `${filenameBase}.jpg`);
+  form.append('api_key', CLOUDINARY_API_KEY);
+  form.append('timestamp', String(timestamp));
+  form.append('folder', CLOUDINARY_FOLDER);
+  form.append('public_id', publicId);
+  form.append('signature', signature);
+
+  const resp = await fetch(endpoint, { method: 'POST', body: form });
+  if (!resp.ok) return null;
+
+  const json = await resp.json();
+  // secure_url should be public
+  return json?.secure_url || json?.url || null;
+}
+
+// ========= Notion Actions =========
+async function createActionFollowUp(taskText) {
+  return notion.pages.create({
+    parent: { database_id: NOTION_ACTION_DB_ID },
+    properties: {
+      [ACTION_PROP_TASK_TITLE]: {
+        title: [{ text: { content: taskText } }],
+      },
+      Scope: { select: { name: 'Line' } },
+      'Action Type': { select: { name: 'Follow up' } },
+      Owner: { multi_select: [{ name: 'Stacy' }] },
+      [ACTION_PROP_STATUS]: { status: { name: 'OPEN' } },
+    },
+  });
+}
+
+async function getTopTasksByStatus(statusName, limit = 5) {
+  // Pull more then sort by rank to ensure correct order
+  const queryLimit = 30;
+
+  const resp = await notion.databases.query({
+    database_id: NOTION_ACTION_DB_ID,
+    page_size: queryLimit,
+    filter: {
+      property: ACTION_PROP_STATUS,
+      status: { equals: statusName },
+    },
+  });
+
+  const pages = resp?.results || [];
+  pages.sort((a, b) => {
+    const pr = getPriorityRank(b) - getPriorityRank(a);
+    if (pr !== 0) return pr;
+    // optional tie-breaker: due date earlier first
+    const da = a?.properties?.[ACTION_PROP_DUE]?.date?.start || '';
+    const db = b?.properties?.[ACTION_PROP_DUE]?.date?.start || '';
+    return da.localeCompare(db);
+  });
+
+  return pages.slice(0, limit);
+}
+
+async function countByStatus(statusNames) {
+  // Notion doesn't provide aggregation; we query counts per status with pagination
+  const counts = {};
+  for (const statusName of statusNames) {
+    let total = 0;
+    let cursor = undefined;
+
+    while (true) {
+      const resp = await notion.databases.query({
+        database_id: NOTION_ACTION_DB_ID,
+        page_size: 100,
+        start_cursor: cursor,
+        filter: {
+          property: ACTION_PROP_STATUS,
+          status: { equals: statusName },
+        },
+      });
+
+      total += (resp?.results || []).length;
+
+      if (!resp?.has_more) break;
+      cursor = resp?.next_cursor;
+      if (!cursor) break;
+    }
+
+    counts[statusName] = total;
+  }
+  return counts;
+}
+
+// ========= Notion Inbox =========
+function buildInboxPropsBase({ itemTitle, rawText, url, files }) {
+  const props = {
+    [INBOX_PROP_TITLE]: {
+      title: [{ text: { content: itemTitle } }],
+    },
+    [INBOX_PROP_RAW]: {
+      rich_text: rawText ? [{ text: { content: rawText } }] : [],
+    },
+    [INBOX_PROP_SOURCE]: {
+      select: { name: 'Line' },
+    },
+    [INBOX_PROP_DATE]: {
+      date: { start: todayYYYYMMDD() },
+    },
+  };
+
+  if (url) props[INBOX_PROP_URL] = { url };
+
+  // Notion "files" needs array of { name, external: { url } }
+  if (Array.isArray(files) && files.length > 0) {
+    props[INBOX_PROP_FILES] = {
+      files: files.map((f) => ({
+        name: f.name || 'attachment',
+        type: 'external',
+        external: { url: f.url },
+      })),
+    };
+  }
+
+  return props;
+}
+
+async function createInboxTextItem(text) {
+  const url = extractFirstUrl(text);
+  let title = null;
+
+  if (url) title = await fetchTitle(url);
+
+  const itemTitle = title || safePreview(text, 60);
+
+  return notion.pages.create({
+    parent: { database_id: NOTION_INBOX_DB_ID },
+    properties: buildInboxPropsBase({
+      itemTitle,
+      rawText: text,
+      url,
+      files: [],
+    }),
+  });
+}
+
+async function createInboxImageItem({ imageUrl, rawNote }) {
+  const itemTitle = `Image - ${todayYYYYMMDD()}`;
+
+  return notion.pages.create({
+    parent: { database_id: NOTION_INBOX_DB_ID },
+    properties: buildInboxPropsBase({
+      itemTitle,
+      rawText: rawNote,
+      url: null,
+      files: imageUrl ? [{ name: 'image', url: imageUrl }] : [],
+    }),
+  });
+}
+
+async function fetchLineMessageContentBuffer(messageId) {
+  const stream = await lineClient.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+// ========= Commands =========
+function buildHelpText() {
+  return [
+    'Commands:',
+    '/f <內容>  → 新增 Follow up 到 Action DB（Status=OPEN）',
+    '/list      → 列出每個 status 的數量',
+    '/list open',
+    '/list Waiting- internal',
+    '/list Waiting- customer',
+    '/list In progress',
+    '',
+    'Non-command:',
+    '- 直接打字 / 分享連結 → 進 INBOX（自動抓 URL → URL 欄位，Today → Date 欄位）',
+    '- 傳圖片 → 進 INBOX（需 Cloudinary 才能寫入 Attachment 檔案欄位）',
+  ].join('\n');
+}
+
+async function handleListCommand(replyToken, fullText) {
+  const args = fullText.split(' ').filter(Boolean);
+
+  // /list only → status counts
+  if (args.length === 1) {
+    // Adjust statuses to exactly match your Notion status option names
+    const statuses = ['open', 'Waiting- internal', 'Waiting- customer', 'In progress'];
+
+    try {
+      const counts = await countByStatus(statuses);
+      const lines = statuses.map((s) => `${s}: ${counts[s] ?? 0}`);
+      return replyText(replyToken, ['Status count:', ...lines].join('\n'));
+    } catch (e) {
+      console.error('List count error:', e);
+      return replyText(replyToken, '讀取 /list 統計失敗（請看 logs）。');
+    }
+  }
+
+  // /list <status...>
+  const status = normalizeStatusArg(fullText.replace(/^\/list\s*/i, ''));
+
+  try {
+    const pages = await getTopTasksByStatus(status, 5);
+    if (!pages.length) return replyText(replyToken, `「${status}」沒有資料。`);
+
+    const lines = pages.map((p, idx) => {
+      const title = getTaskTitle(p) || '(無標題)';
+      const due = formatDueDate(p?.properties?.[ACTION_PROP_DUE]);
+      return due ? `${idx + 1}. ${title} (${due})` : `${idx + 1}. ${title}`;
+    });
+
+    return replyText(replyToken, [`${status} top 5:`, ...lines].join('\n'));
+  } catch (e) {
+    console.error('List status error:', e);
+    return replyText(replyToken, '讀取 /list 失敗（請看 logs）。');
+  }
+}
+
+// ========= LINE Handlers =========
 async function handleTextMessage(event) {
   const replyToken = event.replyToken;
   const text = (event.message?.text || '').trim();
 
-  if (!text) {
-    return replyText(replyToken, '收到空白訊息，未寫入。');
+  if (!text) return replyText(replyToken, '收到空白訊息，未寫入。');
+
+  // /f (help)
+  if (text === '/f') {
+    return replyText(replyToken, buildHelpText());
   }
 
-  // /help
-  if (text === '/help' || text === '/h') {
-    const msg =
-      [
-        '可用指令：',
-        '/f <內容>  → 新增 Follow up 到 Action DB（Status=OPEN）',
-        '? <關鍵字> → 搜尋 Action DB（Task contains），回傳前 5 筆（含 Due date）',
-        '',
-        '不打指令：',
-        '- 直接寫入 INBOX DB',
-        '- 若含 URL：自動抓標題→Item、原文→原文、網址→URL',
-      ].join('\n');
-    return replyText(replyToken, msg);
-  }
-
-  // /f
-  if (text === '/f' || text.startsWith('/f ')) {
+  // /f <task>
+  if (text.startsWith('/f ')) {
     const taskText = text.replace(/^\/f\s*/i, '').trim();
-    if (!taskText) {
-      return replyText(replyToken, '用法：/f <要追蹤的事項>');
-    }
+    if (!taskText) return replyText(replyToken, '用法：/f <要追蹤的事項>');
 
     try {
       await createActionFollowUp(taskText);
-      return replyText(replyToken, `已記錄：${taskText}\n（我會幫你建立到 Notion Action DB）`);
+      return replyText(replyToken, `已記錄到 Action DB：${safePreview(taskText, 80)}`);
     } catch (e) {
       console.error('Notion write error (Action DB):', e);
-      return replyText(replyToken, '寫入 Action DB 失敗（請看 Render logs）。');
+      return replyText(replyToken, '寫入 Action DB 失敗（請看 logs）。');
     }
   }
 
-  // ? keyword  搜尋 Action DB
-  if (text.startsWith('?')) {
-    const keyword = text.replace(/^\?\s*/i, '').trim();
-    if (!keyword) {
-      return replyText(replyToken, '用法：? <關鍵字>');
-    }
-
-    try {
-      const pages = await searchActionTasks(keyword, 5);
-      if (!pages.length) {
-        return replyText(replyToken, `找不到符合「${keyword}」的 Task。`);
-      }
-
-      // Due Date 欄位看起來叫 Due Date（你截圖有 Due Date）
-      const lines = pages.map((p, idx) => {
-        const title = getTaskTitle(p) || '(無標題)';
-        const due = formatDueDate(p?.properties?.['Due Date']);
-        return due ? `${idx + 1}. ${title} (${due})` : `${idx + 1}. ${title}`;
-      });
-
-      const msg = [`搜尋「${keyword}」前 5 筆：`, ...lines].join('\n');
-      return replyText(replyToken, msg);
-    } catch (e) {
-      console.error('Notion search error (Action DB):', e);
-      return replyText(replyToken, '搜尋失敗（請看 Render logs）。');
-    }
+  // /list ...
+  if (text === '/list' || text.startsWith('/list ')) {
+    return handleListCommand(replyToken, text);
   }
 
-  // default → INBOX
+  // Non-command → INBOX
   try {
-    await createInboxItem(text);
+    await createInboxTextItem(text);
     return replyText(replyToken, `已收進 INBOX：${safePreview(text, 60)}`);
   } catch (e) {
-    console.error('Notion write error (INBOX DB):', e);
-    return replyText(replyToken, '寫入 INBOX 失敗（請看 Render logs）。');
+    console.error('Notion write error (INBOX text):', e);
+    return replyText(replyToken, '寫入 INBOX 失敗（請看 logs）。');
+  }
+}
+
+async function handleImageMessage(event) {
+  const replyToken = event.replyToken;
+  const messageId = event.message?.id;
+
+  if (!messageId) return replyText(replyToken, '圖片處理失敗：缺少 message id。');
+
+  try {
+    const buf = await fetchLineMessageContentBuffer(messageId);
+
+    let publicUrl = null;
+    if (CLOUDINARY_ENABLED) {
+      publicUrl = await uploadToCloudinary(buf, `line-${messageId}`);
+    }
+
+    const rawNote = [
+      '[Image]',
+      `messageId=${messageId}`,
+      publicUrl ? `uploaded=${publicUrl}` : 'uploaded=SKIPPED (no Cloudinary env)',
+    ].join('\n');
+
+    await createInboxImageItem({ imageUrl: publicUrl, rawNote });
+
+    if (publicUrl) {
+      return replyText(replyToken, '已收進 INBOX（含 Attachment 圖片檔）。');
+    }
+    return replyText(
+      replyToken,
+      '已收進 INBOX（但 Attachment 需要 Cloudinary 才能寫入公開檔案 URL）。'
+    );
+  } catch (e) {
+    console.error('Notion/LINE image handling error:', e);
+    return replyText(replyToken, '圖片寫入 INBOX 失敗（請看 logs）。');
+  }
+}
+
+async function handleNonTextMessage(event) {
+  // For file/video/audio/location/sticker: store a simple record to INBOX
+  const replyToken = event.replyToken;
+  const type = event.message?.type || 'unknown';
+  const messageId = event.message?.id || '';
+
+  const rawText = `[${type}]\nmessageId=${messageId}`;
+
+  try {
+    const itemTitle = `${type} - ${todayYYYYMMDD()}`;
+    await notion.pages.create({
+      parent: { database_id: NOTION_INBOX_DB_ID },
+      properties: buildInboxPropsBase({
+        itemTitle,
+        rawText,
+        url: null,
+        files: [],
+      }),
+    });
+    return replyText(replyToken, `已收進 INBOX：${type}`);
+  } catch (e) {
+    console.error('Notion write error (INBOX non-text):', e);
+    return replyText(replyToken, '寫入 INBOX 失敗（請看 logs）。');
   }
 }
 
 async function handleEvent(event) {
   try {
-    if (event.type === 'message' && event.message.type === 'text') {
-      return handleTextMessage(event);
-    }
-    // 其他事件先忽略
-    return null;
+    if (event.type !== 'message') return null;
+
+    const msgType = event.message?.type;
+
+    if (msgType === 'text') return handleTextMessage(event);
+    if (msgType === 'image') return handleImageMessage(event);
+
+    return handleNonTextMessage(event);
   } catch (e) {
     console.error('handleEvent error:', e);
     return null;
@@ -303,11 +581,11 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
-  // 先回 200，避免 LINE timeout
+  // respond quickly to prevent LINE timeout
   res.sendStatus(200);
 
   const events = req.body?.events || [];
-  console.log('LINE events:', events.map(e => e.type));
+  console.log('LINE events:', events.map((e) => `${e.type}:${e.message?.type || ''}`));
 
   Promise.allSettled(events.map(handleEvent)).catch((e) => {
     console.error('Promise.allSettled error:', e);
@@ -317,5 +595,5 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 // ========= Start =========
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  console.log(`Server running at http://localhost:${PORT}/`);
+  console.log(`CLOUDINARY_ENABLED=${CLOUDINARY_ENABLED}`);
 });
