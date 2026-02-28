@@ -28,9 +28,9 @@ if (!NOTION_INBOX_DB_ID) throw new Error('no notion inbox db id');
 // ========= Notion property names =========
 // Action DB
 const ACTION_PROP_TASK_TITLE = 'Task';
-const ACTION_PROP_STATUS = 'Status';          // status property
-const ACTION_PROP_PRIORITY = 'Priority Level';// select
-const ACTION_PROP_DUE = 'Due date';           // date
+const ACTION_PROP_STATUS = 'Status';           // status property
+const ACTION_PROP_PRIORITY = 'Priority Level'; // select
+const ACTION_PROP_DUE = 'Due date';            // date
 
 // Inbox DB
 const INBOX_PROP_TITLE = 'Item';        // title
@@ -144,6 +144,7 @@ function getTaskTitle(page) {
 function getPriorityRank(page) {
   const p = page?.properties?.[ACTION_PROP_PRIORITY];
   const name = p?.select?.name || '';
+  // customize mapping if your priority values differ
   const map = {
     High: 3,
     Medium: 2,
@@ -166,7 +167,11 @@ function getQuickReply() {
     items: [
       {
         type: 'action',
-        action: { type: 'message', label: '➕ Follow up', text: '/f ' },
+        action: { type: 'message', label: '➕ Follow up', text: '/f ' }, // note trailing space
+      },
+      {
+        type: 'action',
+        action: { type: 'message', label: '🔍 Search Action', text: '? ' }, // note trailing space
       },
       {
         type: 'action',
@@ -190,7 +195,7 @@ function getQuickReply() {
       },
       {
         type: 'action',
-        action: { type: 'message', label: 'ℹ️ Help', text: '/f' },
+        action: { type: 'message', label: 'ℹ️ Help', text: '/help' },
       },
     ],
   };
@@ -315,6 +320,23 @@ async function countByStatus(statusNames) {
   return counts;
 }
 
+async function searchActionTasks(keyword, limit = 5) {
+  const resp = await notion.databases.query({
+    database_id: NOTION_ACTION_DB_ID,
+    page_size: 20,
+    filter: {
+      property: ACTION_PROP_TASK_TITLE,
+      title: {
+        contains: keyword,
+      },
+    },
+  });
+
+  const pages = resp?.results || [];
+  pages.sort((a, b) => getPriorityRank(b) - getPriorityRank(a));
+  return pages.slice(0, limit);
+}
+
 // ========= Notion Inbox =========
 function buildInboxPropsBase({ itemTitle, rawText, url, files }) {
   const props = {
@@ -395,6 +417,7 @@ function buildHelpText() {
   return [
     'Commands:',
     '/f <內容>  → 新增 Follow up 到 Action DB（Status=OPEN）',
+    '? <關鍵字> → 搜尋 Action DB（Task contains），回傳前 5 筆（含 Due date）',
     '/list      → 列出每個 status 的數量',
     '/list open',
     '/list Waiting- internal',
@@ -449,7 +472,12 @@ async function handleTextMessage(event) {
 
   if (!text) return replyText(replyToken, '收到空白訊息，未寫入。');
 
-  // /f (help)
+  // help
+  if (text === '/help' || text === '/h') {
+    return replyText(replyToken, buildHelpText());
+  }
+
+  // /f (show help)
   if (text === '/f') {
     return replyText(replyToken, buildHelpText());
   }
@@ -465,6 +493,28 @@ async function handleTextMessage(event) {
     } catch (e) {
       console.error('Notion write error (Action DB):', e);
       return replyText(replyToken, '寫入 Action DB 失敗（請看 logs）。');
+    }
+  }
+
+  // ? keyword search Action DB
+  if (text.startsWith('?')) {
+    const keyword = text.replace(/^\?\s*/i, '').trim();
+    if (!keyword) return replyText(replyToken, '用法：? <關鍵字>');
+
+    try {
+      const pages = await searchActionTasks(keyword, 5);
+      if (!pages.length) return replyText(replyToken, `找不到「${keyword}」相關 Task。`);
+
+      const lines = pages.map((p, idx) => {
+        const title = getTaskTitle(p) || '(無標題)';
+        const due = formatDueDate(p?.properties?.[ACTION_PROP_DUE]);
+        return due ? `${idx + 1}. ${title} (${due})` : `${idx + 1}. ${title}`;
+      });
+
+      return replyText(replyToken, [`搜尋「${keyword}」前 5 筆：`, ...lines].join('\n'));
+    } catch (e) {
+      console.error('Action search error:', e);
+      return replyText(replyToken, '搜尋 Action DB 失敗（請看 logs）。');
     }
   }
 
