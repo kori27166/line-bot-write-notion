@@ -618,7 +618,12 @@ async function handleEvent(event) {
       textPreview: (event.message?.text || '').slice(0, 80),
     });
 
-    if (event.type !== 'message') return null;
+   if (event.type !== 'message') {
+  if (event.replyToken) {
+    return replyText(event.replyToken, `收到非 message event: ${event.type}`);
+  }
+  return null;
+}
 
     const msgType = event.message?.type;
 
@@ -639,6 +644,9 @@ app.get('/', (req, res) => {
 
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   res.sendStatus(200);
+
+  console.log('[WEBHOOK HIT] at', new Date().toISOString());
+  console.log('[WEBHOOK HEADERS]', req.headers['user-agent'], req.headers['x-line-signature'] ? 'has-signature' : 'no-signature');
 
   const events = req.body?.events || [];
   console.log('LINE events:', events.map((e) => `${e.type}:${e.message?.type || ''}`));
