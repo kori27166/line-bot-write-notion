@@ -87,8 +87,6 @@ function setMode(userId, mode) {
 function getMode(userId) {
   const v = userMode.get(userId);
   if (!v) return null;
-
-  // auto-expire in 5 minutes
   if (Date.now() - v.ts > 5 * 60 * 1000) {
     userMode.delete(userId);
     return null;
@@ -120,8 +118,7 @@ async function fetchTitle(url) {
       redirect: 'follow',
       signal: controller.signal,
       headers: {
-        'user-agent':
-          'Mozilla/5.0 (compatible; LineNotionBot/1.0; +https://onrender.com)',
+        'user-agent': 'Mozilla/5.0 (compatible; LineNotionBot/1.0; +https://onrender.com)',
         accept: 'text/html,application/xhtml+xml',
       },
     });
@@ -173,25 +170,10 @@ function normalizeStatusArg(raw) {
   return (raw || '').trim();
 }
 
-// ========= Reply helpers =========
-async function replyText(replyToken, text) {
-  if (!replyToken) return;
-  return lineClient.replyMessage(replyToken, { type: 'text', text });
-}
-
-async function replyFlex(replyToken, altText, contents) {
-  if (!replyToken) return;
-  return lineClient.replyMessage(replyToken, {
-    type: 'flex',
-    altText: altText || 'Menu',
-    contents,
-  });
-}
-
+// ========= Postback helpers =========
 function pb(dataObj) {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(dataObj)) params.set(k, String(v));
-  // LINE postback data limit exists; keep it short
   return params.toString();
 }
 
@@ -200,6 +182,41 @@ function parsePostbackData(data) {
   const obj = {};
   for (const [k, v] of params.entries()) obj[k] = v;
   return obj;
+}
+
+// ========= Quick Reply (postback actions, no “send message”) =========
+function getQuickReply() {
+  return {
+    items: [
+      { type: 'action', action: { type: 'postback', label: '📋 Menu', data: pb({ nav: 'main' }) } },
+      { type: 'action', action: { type: 'postback', label: '➕ Follow up', data: pb({ act: 'followup_start' }) } },
+      { type: 'action', action: { type: 'postback', label: '🔍 Search', data: pb({ act: 'search_start' }) } },
+      { type: 'action', action: { type: 'postback', label: '📊 List', data: pb({ act: 'list_count' }) } },
+      { type: 'action', action: { type: 'postback', label: '📂 Status', data: pb({ nav: 'status_menu' }) } },
+      { type: 'action', action: { type: 'postback', label: '❌ Cancel', data: pb({ act: 'cancel_mode' }) } },
+      { type: 'action', action: { type: 'postback', label: 'ℹ️ Help', data: pb({ act: 'help' }) } },
+    ],
+  };
+}
+
+// ========= Reply helpers =========
+async function replyText(replyToken, text) {
+  if (!replyToken) return;
+  return lineClient.replyMessage(replyToken, {
+    type: 'text',
+    text,
+    quickReply: getQuickReply(),
+  });
+}
+
+async function replyFlex(replyToken, altText, contents) {
+  if (!replyToken) return;
+  return lineClient.replyMessage(replyToken, {
+    type: 'flex',
+    altText: altText || 'Menu',
+    contents,
+    quickReply: getQuickReply(),
+  });
 }
 
 // ========= Flex Menus =========
@@ -216,35 +233,11 @@ function flexMainMenu() {
         { type: 'text', text: '選擇要操作的資料庫', size: 'sm', color: '#666666', wrap: true },
         { type: 'separator', margin: 'md' },
 
-        {
-          type: 'button',
-          style: 'primary',
-          action: { type: 'postback', label: 'Action DB', data: pb({ nav: 'action' }) },
-        },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: 'Inbox DB', data: pb({ nav: 'inbox' }) },
-        },
-
-        // placeholders for future DBs
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: '（預留）DB-3', data: pb({ nav: 'db3' }) },
-        },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: '（預留）DB-4', data: pb({ nav: 'db4' }) },
-        },
+        { type: 'button', style: 'primary', action: { type: 'postback', label: 'Action DB', data: pb({ nav: 'action' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Inbox DB', data: pb({ nav: 'inbox' }) } },
 
         { type: 'separator', margin: 'md' },
-        {
-          type: 'button',
-          style: 'link',
-          action: { type: 'postback', label: 'Help', data: pb({ act: 'help' }) },
-        },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Help', data: pb({ act: 'help' }) } },
       ],
     },
   };
@@ -263,33 +256,13 @@ function flexActionMenu() {
         { type: 'text', text: '選擇動作', size: 'sm', color: '#666666' },
         { type: 'separator', margin: 'md' },
 
-        {
-          type: 'button',
-          style: 'primary',
-          action: { type: 'postback', label: 'List Count', data: pb({ act: 'list_count' }) },
-        },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: 'List Top 5 (by status)', data: pb({ nav: 'status_menu' }) },
-        },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: 'Follow up (新增)', data: pb({ act: 'followup_start' }) },
-        },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: 'Search Action (搜尋)', data: pb({ act: 'search_start' }) },
-        },
+        { type: 'button', style: 'primary', action: { type: 'postback', label: 'List Count', data: pb({ act: 'list_count' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'List Top 5 (by status)', data: pb({ nav: 'status_menu' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Follow up (新增)', data: pb({ act: 'followup_start' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Search Action (搜尋)', data: pb({ act: 'search_start' }) } },
 
         { type: 'separator', margin: 'md' },
-        {
-          type: 'button',
-          style: 'link',
-          action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) },
-        },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) } },
       ],
     },
   };
@@ -320,11 +293,7 @@ function flexStatusMenu() {
           action: { type: 'postback', label: s.label, data: pb({ act: 'list_status', status: s.value }) },
         })),
         { type: 'separator', margin: 'md' },
-        {
-          type: 'button',
-          style: 'link',
-          action: { type: 'postback', label: 'Back', data: pb({ nav: 'action' }) },
-        },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Back', data: pb({ nav: 'action' }) } },
       ],
     },
   };
@@ -340,19 +309,11 @@ function flexInboxMenu() {
       spacing: 'md',
       contents: [
         { type: 'text', text: 'Inbox DB', weight: 'bold', size: 'xl' },
-        { type: 'text', text: '目前 Inbox 是「直接打字/分享連結/傳圖」自動寫入', size: 'sm', color: '#666666', wrap: true },
+        { type: 'text', text: '直接打字/分享連結/傳圖會自動寫入', size: 'sm', color: '#666666', wrap: true },
         { type: 'separator', margin: 'md' },
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: '說明（如何寫入）', data: pb({ act: 'inbox_help' }) },
-        },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: '說明', data: pb({ act: 'inbox_help' }) } },
         { type: 'separator', margin: 'md' },
-        {
-          type: 'button',
-          style: 'link',
-          action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) },
-        },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Back', data: pb({ nav: 'main' }) } },
       ],
     },
   };
@@ -455,10 +416,7 @@ async function searchActionTasks(keyword, limit = 5) {
   const resp = await notion.databases.query({
     database_id: NOTION_ACTION_DB_ID,
     page_size: 20,
-    filter: {
-      property: ACTION_PROP_TASK_TITLE,
-      title: { contains: keyword },
-    },
+    filter: { property: ACTION_PROP_TASK_TITLE, title: { contains: keyword } },
   });
 
   const pages = resp?.results || [];
@@ -495,10 +453,7 @@ async function createInboxTextItem(text) {
   if (url) title = await fetchTitle(url);
 
   const itemTitle = title || safePreview(text, 60);
-
-  const properties = pickExistingInboxProps(
-    buildInboxPropsBase({ itemTitle, rawText: text, url, files: [] })
-  );
+  const properties = pickExistingInboxProps(buildInboxPropsBase({ itemTitle, rawText: text, url, files: [] }));
 
   return notion.pages.create({
     parent: { database_id: NOTION_INBOX_DB_ID },
@@ -529,22 +484,19 @@ async function fetchLineMessageContentBuffer(messageId) {
   return Buffer.concat(chunks);
 }
 
-// ========= Commands text =========
+// ========= Help text =========
 function buildHelpText() {
   return [
-    'Commands (backup):',
-    '/menu       → 打開選單（Flex）',
-    '/f <內容>   → 新增 Follow up 到 Action DB（Status=OPEN）',
-    '? <關鍵字>  → 搜尋 Action DB（Task contains），回傳前 5 筆（含 Due date）',
-    '/list       → 列出每個 status 的數量',
-    '/list open',
-    '/list Waiting- internal',
-    '/list Waiting- customer',
-    '/list In progress',
+    'Flex 操作：用下方按鈕（Menu / Follow up / Search / List）',
     '',
-    'Inbox:',
-    '- 直接打字/分享連結 → 進 INBOX（自動抓 URL→URL 欄位）',
-    '- 傳圖片 → 進 INBOX（有 Cloudinary 才能寫入 Attachment）',
+    'Commands（備援）：',
+    '/menu       → 打開 Flex 主選單',
+    '/followup   → 進入 Follow up 輸入模式',
+    '/search     → 進入 Search 輸入模式',
+    '/f <內容>   → 直接新增 Follow up',
+    '? <關鍵字>  → 直接搜尋 Action DB',
+    '/list       → status count',
+    '/list <status> → top 5',
   ].join('\n');
 }
 
@@ -595,17 +547,17 @@ async function handlePostback(event) {
   if (data.nav === 'action') return replyFlex(replyToken, 'Action menu', flexActionMenu());
   if (data.nav === 'status_menu') return replyFlex(replyToken, 'Status menu', flexStatusMenu());
   if (data.nav === 'inbox') return replyFlex(replyToken, 'Inbox menu', flexInboxMenu());
-  if (data.nav === 'db3') return replyText(replyToken, 'DB-3 尚未接上（之後你給我 DB ID/欄位就能加）。');
-  if (data.nav === 'db4') return replyText(replyToken, 'DB-4 尚未接上（之後你給我 DB ID/欄位就能加）。');
 
   // actions
   if (data.act === 'help') return replyText(replyToken, buildHelpText());
 
+  if (data.act === 'cancel_mode') {
+    setMode(userId, null);
+    return replyText(replyToken, '已取消輸入模式。');
+  }
+
   if (data.act === 'inbox_help') {
-    return replyText(
-      replyToken,
-      ['Inbox DB：', '- 直接打字/分享連結會自動寫入', '- 傳圖片也會寫入（Attachment 需 Cloudinary）', '- 如要做 Inbox 查詢/分類，之後可加在這裡'].join('\n')
-    );
+    return replyText(replyToken, ['Inbox DB：', '- 直接打字/分享連結 → 自動寫入', '- 傳圖片 → 自動寫入（Attachment 需 Cloudinary）'].join('\n'));
   }
 
   if (data.act === 'list_count') {
@@ -650,10 +602,10 @@ async function handlePostback(event) {
     return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
   }
 
-  return replyText(replyToken, '未識別的操作（請用 /menu 重新開啟選單）。');
+  return replyText(replyToken, '未識別的操作（請按 Menu 重新開啟）。');
 }
 
-// ========= LINE Handlers =========
+// ========= Message handlers =========
 async function handleTextMessage(event) {
   const replyToken = event.replyToken;
   const text = (event.message?.text || '').trim();
@@ -664,14 +616,22 @@ async function handleTextMessage(event) {
   // Flex menu entry
   if (text === '/menu') return replyFlex(replyToken, 'Main menu', flexMainMenu());
 
-  // backup commands
+  // keep old habits
+  if (text === '/followup') {
+    setMode(userId, 'FOLLOWUP');
+    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
+  }
+  if (text === '/search') {
+    setMode(userId, 'SEARCH');
+    return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
+  }
+
   if (text === '/help' || text === '/h') return replyText(replyToken, buildHelpText());
 
   // consume mode
   const mode = getMode(userId);
   const maybeUrl = extractFirstUrl(text);
 
-  // if user shares URL while in mode, treat as INBOX and cancel mode
   if (mode && maybeUrl) {
     setMode(userId, null);
     try {
@@ -717,8 +677,6 @@ async function handleTextMessage(event) {
   }
 
   // legacy: /f
-  if (text === '/f') return replyText(replyToken, buildHelpText());
-
   if (text.startsWith('/f ')) {
     const taskText = text.replace(/^\/f\s*/i, '').trim();
     if (!taskText) return replyText(replyToken, '用法：/f <要追蹤的事項>');
@@ -779,9 +737,7 @@ async function handleImageMessage(event) {
     const buf = await fetchLineMessageContentBuffer(messageId);
 
     let publicUrl = null;
-    if (CLOUDINARY_ENABLED) {
-      publicUrl = await uploadToCloudinary(buf, `line-${messageId}`);
-    }
+    if (CLOUDINARY_ENABLED) publicUrl = await uploadToCloudinary(buf, `line-${messageId}`);
 
     const rawNote = [
       '[Image]',
@@ -834,13 +790,9 @@ async function handleEvent(event) {
 
     if (event.type === 'postback') return handlePostback(event);
 
-    if (event.type !== 'message') {
-      // keep quiet for non-message events
-      return null;
-    }
+    if (event.type !== 'message') return null;
 
     const msgType = event.message?.type;
-
     if (msgType === 'text') return handleTextMessage(event);
     if (msgType === 'image') return handleImageMessage(event);
 
