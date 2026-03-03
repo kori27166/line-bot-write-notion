@@ -6,6 +6,8 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 const { Client: NotionClient } = require('@notionhq/client');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -18,6 +20,11 @@ const NOTION_ACTION_DB_ID = process.env.NOTION_ACTION_DB_ID;
 const NOTION_INBOX_DB_ID = process.env.NOTION_INBOX_DB_ID;
 
 const PORT = process.env.PORT || 8888;
+
+// Rich Menu (optional, recommended)
+const RICH_MENU_ID = process.env.RICH_MENU_ID || ''; // if you already created one, put id here to reuse
+const RICH_MENU_IMAGE_PATH = process.env.RICH_MENU_IMAGE_PATH || './richmenu.png'; // 2500x1686 PNG recommended
+const RICH_MENU_ENABLE_DEFAULT = (process.env.RICH_MENU_ENABLE_DEFAULT || 'true').toLowerCase() === 'true';
 
 if (!CHANNEL_ACCESS_TOKEN) throw new Error('no channel access token');
 if (!CHANNEL_SECRET) throw new Error('no channel secret');
@@ -184,29 +191,10 @@ function parsePostbackData(data) {
   return obj;
 }
 
-// ========= Quick Reply (postback actions, no “send message”) =========
-function getQuickReply() {
-  return {
-    items: [
-      { type: 'action', action: { type: 'postback', label: '📋 Menu', data: pb({ nav: 'main' }) } },
-      { type: 'action', action: { type: 'postback', label: '➕ Follow up', data: pb({ act: 'followup_start' }) } },
-      { type: 'action', action: { type: 'postback', label: '🔍 Search', data: pb({ act: 'search_start' }) } },
-      { type: 'action', action: { type: 'postback', label: '📊 List', data: pb({ act: 'list_count' }) } },
-      { type: 'action', action: { type: 'postback', label: '📂 Status', data: pb({ nav: 'status_menu' }) } },
-      { type: 'action', action: { type: 'postback', label: '❌ Cancel', data: pb({ act: 'cancel_mode' }) } },
-      { type: 'action', action: { type: 'postback', label: 'ℹ️ Help', data: pb({ act: 'help' }) } },
-    ],
-  };
-}
-
-// ========= Reply helpers =========
+// ========= Reply helpers (Rich Menu does not need quickReply) =========
 async function replyText(replyToken, text) {
   if (!replyToken) return;
-  return lineClient.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply: getQuickReply(),
-  });
+  return lineClient.replyMessage(replyToken, { type: 'text', text });
 }
 
 async function replyFlex(replyToken, altText, contents) {
@@ -215,11 +203,10 @@ async function replyFlex(replyToken, altText, contents) {
     type: 'flex',
     altText: altText || 'Menu',
     contents,
-    quickReply: getQuickReply(),
   });
 }
 
-// ========= Flex Menus =========
+// ========= Flex Menus (still useful as in-chat menu) =========
 function flexMainMenu() {
   return {
     type: 'bubble',
@@ -487,7 +474,13 @@ async function fetchLineMessageContentBuffer(messageId) {
 // ========= Help text =========
 function buildHelpText() {
   return [
-    'Flex 操作：用下方按鈕（Menu / Follow up / Search / List）',
+    'Rich Menu 操作（底部固定選單）：',
+    '- Action：Action DB 操作選單',
+    '- Inbox：Inbox DB 說明',
+    '- Follow up：進入輸入模式（下一則訊息建立 Follow up）',
+    '- Search：進入搜尋模式（下一則訊息搜尋 Action DB）',
+    '- List：status count / 可再選 status top5',
+    '- Help：顯示本說明',
     '',
     'Commands（備援）：',
     '/menu       → 打開 Flex 主選單',
@@ -531,6 +524,93 @@ async function handleListCommand(replyToken, fullText) {
   } catch (e) {
     console.error('List status error:', e);
     return replyText(replyToken, '讀取 /list 失敗（請看 logs）。');
+  }
+}
+
+// ========= Rich Menu definition =========
+// Layout: 2500 x 1686, 6 buttons (2 columns x 3 rows)
+function buildRichMenuObject() {
+  return {
+    size: { width: 2500, height: 1686 },
+    selected: true,
+    name: 'NotionBotMenu',
+    chatBarText: 'Menu',
+    areas: [
+      // Row 1
+      {
+        bounds: { x: 0, y: 0, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ nav: 'action' }), displayText: 'Action' },
+      },
+      {
+        bounds: { x: 1250, y: 0, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ nav: 'inbox' }), displayText: 'Inbox' },
+      },
+      // Row 2
+      {
+        bounds: { x: 0, y: 562, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ act: 'followup_start' }), displayText: 'Follow up' },
+      },
+      {
+        bounds: { x: 1250, y: 562, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ act: 'search_start' }), displayText: 'Search' },
+      },
+      // Row 3
+      {
+        bounds: { x: 0, y: 1124, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ nav: 'status_menu' }), displayText: 'List' },
+      },
+      {
+        bounds: { x: 1250, y: 1124, width: 1250, height: 562 },
+        action: { type: 'postback', data: pb({ act: 'help' }), displayText: 'Help' },
+      },
+    ],
+  };
+}
+
+async function ensureRichMenu() {
+  if (!RICH_MENU_ENABLE_DEFAULT) {
+    console.log('[RICH MENU] disabled by env RICH_MENU_ENABLE_DEFAULT=false');
+    return null;
+  }
+
+  // If you already have an id, set it as default and return
+  if (RICH_MENU_ID) {
+    try {
+      await lineClient.setDefaultRichMenu(RICH_MENU_ID);
+      console.log('[RICH MENU] set default from env RICH_MENU_ID:', RICH_MENU_ID);
+      return RICH_MENU_ID;
+    } catch (e) {
+      console.error('[RICH MENU] failed to set default from env RICH_MENU_ID:', e);
+      // continue to create a new one
+    }
+  }
+
+  // Create new
+  try {
+    const richMenuId = await lineClient.createRichMenu(buildRichMenuObject());
+    console.log('[RICH MENU] created:', richMenuId);
+
+    // Upload image if available
+    const abs = path.resolve(RICH_MENU_IMAGE_PATH);
+    if (fs.existsSync(abs)) {
+      const img = fs.readFileSync(abs);
+      // SDK supports Buffer; content-type must match your file
+      const contentType = abs.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+      await lineClient.setRichMenuImage(richMenuId, img, contentType);
+      console.log('[RICH MENU] image uploaded:', abs);
+    } else {
+      console.log('[RICH MENU] image file not found, skip upload:', abs);
+      console.log('[RICH MENU] Put a 2500x1686 image at that path, or set env RICH_MENU_IMAGE_PATH');
+    }
+
+    await lineClient.setDefaultRichMenu(richMenuId);
+    console.log('[RICH MENU] set default:', richMenuId);
+
+    console.log('[RICH MENU] TIP: copy this id into env RICH_MENU_ID to reuse next deploy:', richMenuId);
+    return richMenuId;
+  } catch (e) {
+    console.error('[RICH MENU] ensureRichMenu error:', e);
+    return null;
   }
 }
 
@@ -602,7 +682,7 @@ async function handlePostback(event) {
     return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
   }
 
-  return replyText(replyToken, '未識別的操作（請按 Menu 重新開啟）。');
+  return replyText(replyToken, '未識別的操作（請用底部 Rich Menu 或輸入 /menu）。');
 }
 
 // ========= Message handlers =========
@@ -613,8 +693,8 @@ async function handleTextMessage(event) {
 
   if (!text) return replyText(replyToken, '收到空白訊息，未寫入。');
 
-  // Flex menu entry
-  if (text === '/menu') return replyFlex(replyToken, 'Main menu', flexMainMenu());
+  // Flex menu entry (backup)
+  if (text === '/menu' || text.toLowerCase() === 'menu') return replyFlex(replyToken, 'Main menu', flexMainMenu());
 
   // keep old habits
   if (text === '/followup') {
@@ -632,6 +712,7 @@ async function handleTextMessage(event) {
   const mode = getMode(userId);
   const maybeUrl = extractFirstUrl(text);
 
+  // If user is in a mode but posts a URL/text, still prefer Inbox behavior for URLs
   if (mode && maybeUrl) {
     setMode(userId, null);
     try {
@@ -829,9 +910,16 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 // ========= Start =========
 async function boot() {
   await loadInboxDbSchema();
+
+  // Create / set default rich menu (persistent bottom menu)
+  await ensureRichMenu();
+
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
     console.log(`CLOUDINARY_ENABLED=${CLOUDINARY_ENABLED}`);
+    console.log(`RICH_MENU_ENABLE_DEFAULT=${RICH_MENU_ENABLE_DEFAULT}`);
+    console.log(`RICH_MENU_ID(env)=${RICH_MENU_ID || '(none)'}`);
+    console.log(`RICH_MENU_IMAGE_PATH=${RICH_MENU_IMAGE_PATH}`);
   });
 }
 
