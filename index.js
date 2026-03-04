@@ -21,8 +21,8 @@ const NOTION_INBOX_DB_ID = process.env.NOTION_INBOX_DB_ID;
 
 const PORT = process.env.PORT || 8888;
 
-// Rich Menu (optional, recommended)
-const RICH_MENU_ID = process.env.RICH_MENU_ID || ''; // if you already created one, put id here to reuse
+// Rich Menu (recommended)
+const RICH_MENU_ID = process.env.RICH_MENU_ID || '';
 const RICH_MENU_IMAGE_PATH = process.env.RICH_MENU_IMAGE_PATH || './richmenu.png'; // 2500x1686 PNG recommended
 const RICH_MENU_ENABLE_DEFAULT = (process.env.RICH_MENU_ENABLE_DEFAULT || 'true').toLowerCase() === 'true';
 
@@ -82,23 +82,29 @@ function pickExistingInboxProps(props) {
   return filtered;
 }
 
-// ========= Simple per-user mode state (in-memory) =========
-const userMode = new Map(); // key: userId, value: {mode:'FOLLOWUP'|'SEARCH', ts:number}
+// ========= Simple per-user state (in-memory) =========
+// value: { mode: string, owner?: string, ts: number }
+const userState = new Map();
 
-function setMode(userId, mode) {
+function setState(userId, obj) {
   if (!userId) return;
-  if (!mode) userMode.delete(userId);
-  else userMode.set(userId, { mode, ts: Date.now() });
+  if (!obj) userState.delete(userId);
+  else userState.set(userId, { ...obj, ts: Date.now() });
 }
 
-function getMode(userId) {
-  const v = userMode.get(userId);
+function getState(userId) {
+  const v = userState.get(userId);
   if (!v) return null;
   if (Date.now() - v.ts > 5 * 60 * 1000) {
-    userMode.delete(userId);
+    userState.delete(userId);
     return null;
   }
-  return v.mode;
+  return v;
+}
+
+function clearState(userId) {
+  if (!userId) return;
+  userState.delete(userId);
 }
 
 // ========= Helpers =========
@@ -191,7 +197,7 @@ function parsePostbackData(data) {
   return obj;
 }
 
-// ========= Reply helpers (Rich Menu does not need quickReply) =========
+// ========= Reply helpers =========
 async function replyText(replyToken, text) {
   if (!replyToken) return;
   return lineClient.replyMessage(replyToken, { type: 'text', text });
@@ -206,7 +212,7 @@ async function replyFlex(replyToken, altText, contents) {
   });
 }
 
-// ========= Flex Menus (still useful as in-chat menu) =========
+// ========= Flex Menus =========
 function flexMainMenu() {
   return {
     type: 'bubble',
@@ -224,7 +230,12 @@ function flexMainMenu() {
         { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Inbox DB', data: pb({ nav: 'inbox' }) } },
 
         { type: 'separator', margin: 'md' },
-        { type: 'button', style: 'link', action: { type: 'postback', label: 'Help', data: pb({ act: 'help' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Follow up', data: pb({ act: 'followup_start' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'Search', data: pb({ act: 'search_start' }) } },
+        { type: 'button', style: 'secondary', action: { type: 'postback', label: 'List', data: pb({ nav: 'status_menu' }) } },
+
+        { type: 'separator', margin: 'md' },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Cancel', data: pb({ act: 'cancel_mode' }) } },
       ],
     },
   };
@@ -306,6 +317,33 @@ function flexInboxMenu() {
   };
 }
 
+function flexOwnerMenu() {
+  const owners = ['Stacy', 'Polo', 'Will', 'Others']; // must match Notion multi-select option names
+  return {
+    type: 'bubble',
+    size: 'mega',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: 'Follow up', weight: 'bold', size: 'xl' },
+        { type: 'text', text: '先選 Owner', size: 'sm', color: '#666666' },
+        { type: 'separator', margin: 'md' },
+
+        ...owners.map((o) => ({
+          type: 'button',
+          style: 'secondary',
+          action: { type: 'postback', label: o, data: pb({ act: 'followup_owner', owner: o }) },
+        })),
+
+        { type: 'separator', margin: 'md' },
+        { type: 'button', style: 'link', action: { type: 'postback', label: 'Cancel', data: pb({ act: 'cancel_mode' }) } },
+      ],
+    },
+  };
+}
+
 // ========= Cloudinary upload =========
 function cloudinarySign(paramsToSign, apiSecret) {
   const keys = Object.keys(paramsToSign).sort();
@@ -342,14 +380,14 @@ async function uploadToCloudinary(buffer, filenameBase = 'line-image') {
 }
 
 // ========= Notion Actions =========
-async function createActionFollowUp(taskText) {
+async function createActionFollowUp(taskText, ownerName = 'Stacy') {
   return notion.pages.create({
     parent: { database_id: NOTION_ACTION_DB_ID },
     properties: {
       [ACTION_PROP_TASK_TITLE]: { title: [{ text: { content: taskText } }] },
       Scope: { select: { name: 'Line' } },
       'Action Type': { select: { name: 'Follow up' } },
-      Owner: { multi_select: [{ name: 'Stacy' }] },
+      Owner: { multi_select: [{ name: ownerName }] }, // Owner is multi-select
       [ACTION_PROP_STATUS]: { status: { name: 'OPEN' } },
     },
   });
@@ -474,19 +512,19 @@ async function fetchLineMessageContentBuffer(messageId) {
 // ========= Help text =========
 function buildHelpText() {
   return [
-    'Rich Menu 操作（底部固定選單）：',
-    '- Action：Action DB 操作選單',
-    '- Inbox：Inbox DB 說明',
-    '- Follow up：進入輸入模式（下一則訊息建立 Follow up）',
-    '- Search：進入搜尋模式（下一則訊息搜尋 Action DB）',
-    '- List：status count / 可再選 status top5',
-    '- Help：顯示本說明',
+    'Rich Menu（底部固定選單）：',
+    '- Action DB：Action DB 操作選單',
+    '- Inbox DB：Inbox DB 說明',
+    '- Follow up：先選 Owner → 下一則訊息建立 Follow up',
+    '- Search：下一則訊息搜尋 Action DB',
+    '- List：選 Status → Top 5',
+    '- Cancel：取消輸入模式',
     '',
     'Commands（備援）：',
     '/menu       → 打開 Flex 主選單',
-    '/followup   → 進入 Follow up 輸入模式',
+    '/followup   → Follow up（先選 Owner）',
     '/search     → 進入 Search 輸入模式',
-    '/f <內容>   → 直接新增 Follow up',
+    '/f <內容>   → 直接新增 Follow up（Owner 預設 Stacy）',
     '? <關鍵字>  → 直接搜尋 Action DB',
     '/list       → status count',
     '/list <status> → top 5',
@@ -545,7 +583,6 @@ function buildRichMenuObject() {
         bounds: { x: 1250, y: 0, width: 1250, height: 562 },
         action: { type: 'postback', data: pb({ nav: 'inbox' }), displayText: 'Inbox DB' },
       },
-
       // Row 2
       {
         bounds: { x: 0, y: 562, width: 1250, height: 562 },
@@ -555,7 +592,6 @@ function buildRichMenuObject() {
         bounds: { x: 1250, y: 562, width: 1250, height: 562 },
         action: { type: 'postback', data: pb({ act: 'search_start' }), displayText: 'Search' },
       },
-
       // Row 3
       {
         bounds: { x: 0, y: 1124, width: 1250, height: 562 },
@@ -575,39 +611,36 @@ async function ensureRichMenu() {
     return null;
   }
 
-  // If you already have an id, set it as default and return
- if (RICH_MENU_ID) {
-  try {
-    // Always re-upload image when file exists (so UI updates)
-    const abs = path.resolve(RICH_MENU_IMAGE_PATH);
-    if (fs.existsSync(abs)) {
-      const img = fs.readFileSync(abs);
-      const contentType = abs.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
-      await lineClient.setRichMenuImage(RICH_MENU_ID, img, contentType);
-      console.log('[RICH MENU] image re-uploaded to existing id:', abs);
-    } else {
-      console.log('[RICH MENU] image file not found, skip re-upload:', abs);
-    }
+  // If you already have an id, re-upload image (so UI updates) and set default
+  if (RICH_MENU_ID) {
+    try {
+      const abs = path.resolve(RICH_MENU_IMAGE_PATH);
+      if (fs.existsSync(abs)) {
+        const img = fs.readFileSync(abs);
+        const contentType = abs.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+        await lineClient.setRichMenuImage(RICH_MENU_ID, img, contentType);
+        console.log('[RICH MENU] image re-uploaded to existing id:', abs);
+      } else {
+        console.log('[RICH MENU] image file not found, skip re-upload:', abs);
+      }
 
-    await lineClient.setDefaultRichMenu(RICH_MENU_ID);
-    console.log('[RICH MENU] set default from env RICH_MENU_ID:', RICH_MENU_ID);
-    return RICH_MENU_ID;
-  } catch (e) {
-    console.error('[RICH MENU] failed to update existing rich menu:', e);
-    // continue to create a new one
+      await lineClient.setDefaultRichMenu(RICH_MENU_ID);
+      console.log('[RICH MENU] set default from env RICH_MENU_ID:', RICH_MENU_ID);
+      return RICH_MENU_ID;
+    } catch (e) {
+      console.error('[RICH MENU] failed to update existing rich menu:', e);
+      // continue to create a new one
+    }
   }
-}
 
   // Create new
   try {
     const richMenuId = await lineClient.createRichMenu(buildRichMenuObject());
     console.log('[RICH MENU] created:', richMenuId);
 
-    // Upload image if available
     const abs = path.resolve(RICH_MENU_IMAGE_PATH);
     if (fs.existsSync(abs)) {
       const img = fs.readFileSync(abs);
-      // SDK supports Buffer; content-type must match your file
       const contentType = abs.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
       await lineClient.setRichMenuImage(richMenuId, img, contentType);
       console.log('[RICH MENU] image uploaded:', abs);
@@ -645,12 +678,15 @@ async function handlePostback(event) {
   if (data.act === 'help') return replyText(replyToken, buildHelpText());
 
   if (data.act === 'cancel_mode') {
-    setMode(userId, null);
+    clearState(userId);
     return replyText(replyToken, '已取消輸入模式。');
   }
 
   if (data.act === 'inbox_help') {
-    return replyText(replyToken, ['Inbox DB：', '- 直接打字/分享連結 → 自動寫入', '- 傳圖片 → 自動寫入（Attachment 需 Cloudinary）'].join('\n'));
+    return replyText(
+      replyToken,
+      ['Inbox DB：', '- 直接打字/分享連結 → 自動寫入', '- 傳圖片 → 自動寫入（Attachment 需 Cloudinary）'].join('\n')
+    );
   }
 
   if (data.act === 'list_count') {
@@ -685,13 +721,21 @@ async function handlePostback(event) {
     }
   }
 
+  // Follow up flow (Owner -> Text)
   if (data.act === 'followup_start') {
-    setMode(userId, 'FOLLOWUP');
-    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
+    setState(userId, { mode: 'FOLLOWUP_WAIT_OWNER' });
+    return replyFlex(replyToken, 'Pick owner', flexOwnerMenu());
+  }
+
+  if (data.act === 'followup_owner') {
+    const owner = (data.owner || '').trim();
+    if (!owner) return replyText(replyToken, '缺少 owner。');
+    setState(userId, { mode: 'FOLLOWUP_WAIT_TEXT', owner });
+    return replyText(replyToken, `Owner: ${owner}\n請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。`);
   }
 
   if (data.act === 'search_start') {
-    setMode(userId, 'SEARCH');
+    setState(userId, { mode: 'SEARCH_WAIT_TEXT' });
     return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
   }
 
@@ -709,25 +753,27 @@ async function handleTextMessage(event) {
   // Flex menu entry (backup)
   if (text === '/menu' || text.toLowerCase() === 'menu') return replyFlex(replyToken, 'Main menu', flexMainMenu());
 
-  // keep old habits
+  // backup commands
   if (text === '/followup') {
-    setMode(userId, 'FOLLOWUP');
-    return replyText(replyToken, '請輸入要 Follow up 的內容（下一則訊息會建立到 Action DB）。');
+    setState(userId, { mode: 'FOLLOWUP_WAIT_OWNER' });
+    return replyFlex(replyToken, 'Pick owner', flexOwnerMenu());
   }
+
   if (text === '/search') {
-    setMode(userId, 'SEARCH');
+    setState(userId, { mode: 'SEARCH_WAIT_TEXT' });
     return replyText(replyToken, '請輸入要搜尋的關鍵字（下一則訊息會搜尋 Action DB）。');
   }
 
   if (text === '/help' || text === '/h') return replyText(replyToken, buildHelpText());
 
-  // consume mode
-  const mode = getMode(userId);
+  // consume state
+  const st = getState(userId);
+  const mode = st?.mode || null;
   const maybeUrl = extractFirstUrl(text);
 
-  // If user is in a mode but posts a URL/text, still prefer Inbox behavior for URLs
+  // If user is in a state but posts a URL, prefer Inbox and exit state
   if (mode && maybeUrl) {
-    setMode(userId, null);
+    clearState(userId);
     try {
       await createInboxTextItem(text);
       return replyText(replyToken, `已收進 INBOX（自動退出模式）：${safePreview(text, 60)}`);
@@ -737,19 +783,20 @@ async function handleTextMessage(event) {
     }
   }
 
-  if (mode === 'FOLLOWUP') {
-    setMode(userId, null);
+  if (mode === 'FOLLOWUP_WAIT_TEXT') {
+    clearState(userId);
+    const owner = st?.owner || 'Stacy';
     try {
-      await createActionFollowUp(text);
-      return replyText(replyToken, `已記錄到 Action DB：${safePreview(text, 80)}`);
+      await createActionFollowUp(text, owner);
+      return replyText(replyToken, `已記錄到 Action DB（Owner: ${owner}）：${safePreview(text, 80)}`);
     } catch (e) {
       console.error('Notion write error (Action DB):', e);
       return replyText(replyToken, '寫入 Action DB 失敗（請看 logs）。');
     }
   }
 
-  if (mode === 'SEARCH') {
-    setMode(userId, null);
+  if (mode === 'SEARCH_WAIT_TEXT') {
+    clearState(userId);
     const keyword = text.trim();
     if (!keyword) return replyText(replyToken, '請輸入關鍵字。');
 
@@ -770,14 +817,14 @@ async function handleTextMessage(event) {
     }
   }
 
-  // legacy: /f
+  // legacy: /f (owner defaults to Stacy)
   if (text.startsWith('/f ')) {
     const taskText = text.replace(/^\/f\s*/i, '').trim();
     if (!taskText) return replyText(replyToken, '用法：/f <要追蹤的事項>');
 
     try {
-      await createActionFollowUp(taskText);
-      return replyText(replyToken, `已記錄到 Action DB：${safePreview(taskText, 80)}`);
+      await createActionFollowUp(taskText, 'Stacy');
+      return replyText(replyToken, `已記錄到 Action DB（Owner: Stacy）：${safePreview(taskText, 80)}`);
     } catch (e) {
       console.error('Notion write error (Action DB):', e);
       return replyText(replyToken, '寫入 Action DB 失敗（請看 logs）。');
