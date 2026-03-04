@@ -576,16 +576,27 @@ async function ensureRichMenu() {
   }
 
   // If you already have an id, set it as default and return
-  if (RICH_MENU_ID) {
-    try {
-      await lineClient.setDefaultRichMenu(RICH_MENU_ID);
-      console.log('[RICH MENU] set default from env RICH_MENU_ID:', RICH_MENU_ID);
-      return RICH_MENU_ID;
-    } catch (e) {
-      console.error('[RICH MENU] failed to set default from env RICH_MENU_ID:', e);
-      // continue to create a new one
+ if (RICH_MENU_ID) {
+  try {
+    // Always re-upload image when file exists (so UI updates)
+    const abs = path.resolve(RICH_MENU_IMAGE_PATH);
+    if (fs.existsSync(abs)) {
+      const img = fs.readFileSync(abs);
+      const contentType = abs.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+      await lineClient.setRichMenuImage(RICH_MENU_ID, img, contentType);
+      console.log('[RICH MENU] image re-uploaded to existing id:', abs);
+    } else {
+      console.log('[RICH MENU] image file not found, skip re-upload:', abs);
     }
+
+    await lineClient.setDefaultRichMenu(RICH_MENU_ID);
+    console.log('[RICH MENU] set default from env RICH_MENU_ID:', RICH_MENU_ID);
+    return RICH_MENU_ID;
+  } catch (e) {
+    console.error('[RICH MENU] failed to update existing rich menu:', e);
+    // continue to create a new one
   }
+}
 
   // Create new
   try {
