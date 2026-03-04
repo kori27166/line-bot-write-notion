@@ -539,12 +539,13 @@ function buildRichMenuObject() {
       // Row 1
       {
         bounds: { x: 0, y: 0, width: 1250, height: 562 },
-        action: { type: 'postback', data: pb({ nav: 'action' }), displayText: 'Action' },
+        action: { type: 'postback', data: pb({ nav: 'action' }), displayText: 'Action DB' },
       },
       {
         bounds: { x: 1250, y: 0, width: 1250, height: 562 },
-        action: { type: 'postback', data: pb({ nav: 'inbox' }), displayText: 'Inbox' },
+        action: { type: 'postback', data: pb({ nav: 'inbox' }), displayText: 'Inbox DB' },
       },
+
       // Row 2
       {
         bounds: { x: 0, y: 562, width: 1250, height: 562 },
@@ -554,6 +555,7 @@ function buildRichMenuObject() {
         bounds: { x: 1250, y: 562, width: 1250, height: 562 },
         action: { type: 'postback', data: pb({ act: 'search_start' }), displayText: 'Search' },
       },
+
       // Row 3
       {
         bounds: { x: 0, y: 1124, width: 1250, height: 562 },
@@ -561,7 +563,7 @@ function buildRichMenuObject() {
       },
       {
         bounds: { x: 1250, y: 1124, width: 1250, height: 562 },
-        action: { type: 'postback', data: pb({ act: 'help' }), displayText: 'Help' },
+        action: { type: 'postback', data: pb({ act: 'cancel_mode' }), displayText: 'Cancel' },
       },
     ],
   };
